@@ -285,6 +285,7 @@ pub enum InferenceSurface {
 
 pub enum DiscoverySurface {
     OpenAiModelsCompatible,
+    ChatGptCodexModels,
     AnthropicModels,
     GeminiModels,
     OllamaTags,
@@ -294,6 +295,11 @@ pub enum DiscoverySurface {
 
 These names describe wire behavior, not provider brands. Multiple provider
 aliases may legitimately use the same surface.
+
+The ChatGPT Codex models endpoint interprets its `client_version` query value
+in the Codex CLI version space. Dirge therefore sends an explicitly pinned,
+wire-compatible Codex version rather than its unrelated package version; the
+pin must be advanced deliberately when that compatibility is reviewed.
 
 `ResolvedProviderDefinition`, `CredentialShape`, and resolved capability
 metadata must not contain raw API keys, access tokens, or refresh tokens.

@@ -8,6 +8,13 @@ use super::backend::{DiscoverySurface, ResolvedDiscovery};
 const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PAGES: usize = 10;
 
+// `client_version` is interpreted in the Codex CLI version space and may be
+// used by the ChatGPT backend to gate catalog rows. Dirge's package version is
+// unrelated (for example, Dirge 0.19 is newer than Codex 0.144), so sending
+// CARGO_PKG_VERSION can make a current Dirge build look like an ancient Codex
+// client. Advance this only when Dirge's Codex wire compatibility is verified.
+const CHATGPT_CODEX_MODELS_CLIENT_VERSION: &str = "0.144.6";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveredModel {
     pub id: String,
@@ -104,7 +111,7 @@ async fn fetch_chatgpt_codex(
 fn chatgpt_codex_models_url(base_url: &str) -> anyhow::Result<reqwest::Url> {
     let mut url = reqwest::Url::parse(&format!("{base_url}/models"))?;
     url.query_pairs_mut()
-        .append_pair("client_version", env!("CARGO_PKG_VERSION"));
+        .append_pair("client_version", CHATGPT_CODEX_MODELS_CLIENT_VERSION);
     Ok(url)
 }
 
@@ -352,14 +359,15 @@ mod tests {
     }
 
     #[test]
-    fn chatgpt_codex_endpoint_includes_dirge_version() {
+    fn chatgpt_codex_endpoint_uses_codex_version_space() {
         let url = chatgpt_codex_models_url("https://chatgpt.com/backend-api/codex").unwrap();
         assert_eq!(
             url.as_str(),
-            format!(
-                "https://chatgpt.com/backend-api/codex/models?client_version={}",
-                env!("CARGO_PKG_VERSION")
-            )
+            "https://chatgpt.com/backend-api/codex/models?client_version=0.144.6"
+        );
+        assert_ne!(
+            CHATGPT_CODEX_MODELS_CLIENT_VERSION,
+            env!("CARGO_PKG_VERSION")
         );
     }
 
