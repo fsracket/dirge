@@ -43,6 +43,7 @@ pub enum InferenceSurface {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiscoverySurface {
     OpenAiModelsCompatible,
+    ChatGptCodexModels,
     AnthropicModels,
     GeminiModels,
     OllamaTags,
@@ -217,7 +218,8 @@ impl ProviderBackend {
         G: FnOnce() -> anyhow::Result<Option<OpenAiOAuthCredential>>,
     {
         let common = self.resolve_common(None, env, load_openai_oauth, resolved_auth_headers)?;
-        let discovery_surface = discovery_surface(self.definition.kind);
+        let discovery_surface =
+            discovery_surface(self.definition.kind, common.auth_mode, &common.credential);
         let base_url = common
             .base_url
             .unwrap_or_else(|| default_discovery_base_url(self.definition.kind).to_string());
@@ -597,8 +599,15 @@ fn inference_surface(
     }
 }
 
-fn discovery_surface(kind: ProviderKind) -> DiscoverySurface {
+fn discovery_surface(
+    kind: ProviderKind,
+    auth: ProviderAuth,
+    credential: &ProviderCredential,
+) -> DiscoverySurface {
     match kind {
+        ProviderKind::OpenAI if auth == ProviderAuth::ChatGpt || credential.is_openai_oauth() => {
+            DiscoverySurface::ChatGptCodexModels
+        }
         ProviderKind::Anthropic => DiscoverySurface::AnthropicModels,
         ProviderKind::Gemini => DiscoverySurface::GeminiModels,
         ProviderKind::Ollama => DiscoverySurface::OllamaTags,
@@ -894,7 +903,7 @@ mod tests {
     }
 
     #[test]
-    fn openai_oauth_surface_and_discovery_url_remain_codex_compatible() {
+    fn openai_oauth_uses_codex_inference_and_catalog_surfaces() {
         let backend = ProviderBackend::new("openai", &HashMap::new(), None).unwrap();
         let oauth = || {
             Ok(Some(OpenAiOAuthCredential::new(
@@ -919,9 +928,26 @@ mod tests {
         let discovery = backend.resolve_discovery_with(no_env, oauth, None).unwrap();
         assert_eq!(
             discovery.discovery_surface,
-            DiscoverySurface::OpenAiModelsCompatible
+            DiscoverySurface::ChatGptCodexModels
         );
         assert_eq!(discovery.discovery_base_url, CHATGPT_CODEX_BASE_URL);
+    }
+
+    #[test]
+    fn openai_api_key_discovery_remains_openai_compatible() {
+        let backend = ProviderBackend::new("openai", &HashMap::new(), None).unwrap();
+        let discovery = backend
+            .resolve_discovery_with(
+                |name| (name == "OPENAI_API_KEY").then(|| "test-key".to_string()),
+                || Ok(None),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            discovery.discovery_surface,
+            DiscoverySurface::OpenAiModelsCompatible
+        );
+        assert_eq!(discovery.discovery_base_url, "https://api.openai.com/v1");
     }
 
     #[test]
@@ -944,7 +970,7 @@ mod tests {
             .expect("catalog discovery historically allows an accountless bearer");
         assert_eq!(
             discovery.discovery_surface,
-            DiscoverySurface::OpenAiModelsCompatible
+            DiscoverySurface::ChatGptCodexModels
         );
     }
 

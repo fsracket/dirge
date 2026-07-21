@@ -23,6 +23,7 @@ struct DiscoveryTransport {
 }
 
 pub struct OpenAiCompatibleDiscoveryClient(DiscoveryTransport);
+pub struct ChatGptCodexDiscoveryClient(DiscoveryTransport);
 pub struct AnthropicDiscoveryClient(DiscoveryTransport);
 pub struct GeminiDiscoveryClient(DiscoveryTransport);
 pub struct OllamaDiscoveryClient(DiscoveryTransport);
@@ -31,6 +32,7 @@ pub struct OllamaDiscoveryClient(DiscoveryTransport);
 /// prevents provider-specific JSON from reaching catalog aggregation or UI.
 pub enum ModelDiscoveryClient {
     OpenAiCompatible(OpenAiCompatibleDiscoveryClient),
+    ChatGptCodex(ChatGptCodexDiscoveryClient),
     Anthropic(AnthropicDiscoveryClient),
     Gemini(GeminiDiscoveryClient),
     Ollama(OllamaDiscoveryClient),
@@ -61,6 +63,9 @@ impl ModelDiscoveryClient {
             DiscoverySurface::OpenAiModelsCompatible => {
                 Self::OpenAiCompatible(OpenAiCompatibleDiscoveryClient(transport))
             }
+            DiscoverySurface::ChatGptCodexModels => {
+                Self::ChatGptCodex(ChatGptCodexDiscoveryClient(transport))
+            }
             DiscoverySurface::AnthropicModels => {
                 Self::Anthropic(AnthropicDiscoveryClient(transport))
             }
@@ -73,6 +78,7 @@ impl ModelDiscoveryClient {
     pub async fn list_models(&self) -> anyhow::Result<Vec<DiscoveredModel>> {
         match self {
             Self::OpenAiCompatible(client) => fetch_openai_compatible(&client.0).await,
+            Self::ChatGptCodex(client) => fetch_chatgpt_codex(&client.0).await,
             Self::Anthropic(client) => fetch_anthropic(&client.0).await,
             Self::Gemini(client) => fetch_gemini(&client.0).await,
             Self::Ollama(client) => fetch_ollama(&client.0).await,
@@ -86,6 +92,20 @@ async fn fetch_openai_compatible(
 ) -> anyhow::Result<Vec<DiscoveredModel>> {
     let json = get_json(transport, format!("{}/models", transport.base_url)).await?;
     parse_openai_models(&json)
+}
+
+async fn fetch_chatgpt_codex(
+    transport: &DiscoveryTransport,
+) -> anyhow::Result<Vec<DiscoveredModel>> {
+    let json = get_json(transport, chatgpt_codex_models_url(&transport.base_url)?).await?;
+    parse_chatgpt_codex_models(&json)
+}
+
+fn chatgpt_codex_models_url(base_url: &str) -> anyhow::Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(&format!("{base_url}/models"))?;
+    url.query_pairs_mut()
+        .append_pair("client_version", env!("CARGO_PKG_VERSION"));
+    Ok(url)
 }
 
 async fn fetch_ollama(transport: &DiscoveryTransport) -> anyhow::Result<Vec<DiscoveredModel>> {
@@ -238,6 +258,34 @@ fn parse_openai_models(json: &Value) -> anyhow::Result<Vec<DiscoveredModel>> {
         .collect())
 }
 
+fn parse_chatgpt_codex_models(json: &Value) -> anyhow::Result<Vec<DiscoveredModel>> {
+    let rows = json
+        .get("models")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("response has no models array"))?;
+    Ok(rows
+        .iter()
+        .filter(|row| row.get("visibility").and_then(Value::as_str) == Some("list"))
+        .filter_map(|row| {
+            let id = row.get("slug")?.as_str()?;
+            let name = row
+                .get("display_name")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let context = row.get("context_window").and_then(Value::as_u64);
+            let tools = row
+                .get("shell_type")
+                .and_then(Value::as_str)
+                .map(|shell_type| shell_type != "disabled");
+            let images = row
+                .get("input_modalities")
+                .and_then(Value::as_array)
+                .map(|values| values.iter().any(|value| value.as_str() == Some("image")));
+            Some(discovered(id, name, context, tools, images))
+        })
+        .collect())
+}
+
 fn discovered(
     id: &str,
     display_name: Option<String>,
@@ -301,6 +349,33 @@ mod tests {
         assert_eq!(rows[0].context_window, Some(200000));
         assert_eq!(rows[0].supports_tools, Some(true));
         assert_eq!(rows[0].supports_images, Some(true));
+    }
+
+    #[test]
+    fn chatgpt_codex_endpoint_includes_dirge_version() {
+        let url = chatgpt_codex_models_url("https://chatgpt.com/backend-api/codex").unwrap();
+        assert_eq!(
+            url.as_str(),
+            format!(
+                "https://chatgpt.com/backend-api/codex/models?client_version={}",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
+    }
+
+    #[test]
+    fn parses_chatgpt_codex_fixture() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("fixtures/chatgpt_codex_models.json")).unwrap();
+        let rows = parse_chatgpt_codex_models(&fixture).unwrap();
+        assert_eq!(rows.len(), 2, "hidden catalog rows stay out of the picker");
+        assert_eq!(rows[0].id, "gpt-fixture-codex");
+        assert_eq!(rows[0].display_name.as_deref(), Some("GPT Fixture Codex"));
+        assert_eq!(rows[0].context_window, Some(272_000));
+        assert_eq!(rows[0].supports_tools, Some(true));
+        assert_eq!(rows[0].supports_images, Some(true));
+        assert_eq!(rows[1].supports_tools, Some(false));
+        assert_eq!(rows[1].supports_images, Some(false));
     }
 
     #[test]
