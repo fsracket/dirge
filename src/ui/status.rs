@@ -183,9 +183,10 @@ impl StatusLine {
         );
 
         format!(
-            "{}{} | {}{} | {}/{} ({}) | {}msgs | {}{}{}{}{}{}{}{}",
+            "{}{} | {} · {}{} | {}/{} ({}) | {}msgs | {}{}{}{}{}{}{}{}",
             project_label,
             cost_str,
+            session.provider,
             session.model,
             loop_badge,
             fmt_tokens(used),
@@ -321,5 +322,23 @@ mod tests {
         let line = StatusLine::render(&session, false, 0, None, None, None, None, None, None);
         let expected = format!(" session:{}", crate::text::short_id(session.id.as_str()));
         assert!(line.contains(&expected), "session id not in status: {line}");
+    }
+
+    #[tokio::test]
+    async fn route_label_tracks_provider_and_model() {
+        let mut session = Session::new("openrouter", "google/gemini-3.5-flash", 100_000);
+        let line = StatusLine::render(&session, false, 0, None, None, None, None, None, None);
+        assert!(
+            line.contains(" | openrouter · google/gemini-3.5-flash | "),
+            "route label missing from status: {line}"
+        );
+
+        session.provider = "deepseek".into();
+        session.model = "deepseek-v4-pro".into();
+        let line = StatusLine::render(&session, false, 0, None, None, None, None, None, None);
+        assert!(
+            line.contains(" | deepseek · deepseek-v4-pro | "),
+            "route label did not follow session switch: {line}"
+        );
     }
 }
