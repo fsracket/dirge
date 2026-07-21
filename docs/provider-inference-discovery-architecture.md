@@ -1,6 +1,6 @@
 # Provider Inference and Model Discovery — Architecture Sketch
 
-Status: proposal for independent review
+Status: revised proposal after independent review
 
 ## Purpose
 
@@ -33,11 +33,20 @@ adapter without changing inference or TUI code.
 Use these terms consistently:
 
 - **Provider definition**: merged configuration for one provider alias.
-- **Resolved provider**: validated, non-secret description of how that alias
-  behaves, including its provider kind, authentication mode, endpoints, and
-  API surfaces.
-- **Provider backend**: provider-level runtime object created from a resolved
-  provider and a protected credential handle.
+- **Resolved provider definition**: validated, non-secret description of the
+  stable policy for an alias: provider kind, configured authentication policy,
+  configured endpoints, headers-by-presence, and rules for selecting API
+  surfaces. It does not claim that credentials have already been resolved.
+- **Credential shape**: non-secret facts that can affect routing, such as
+  whether a credential is present, whether it is an API key or OAuth token,
+  and whether it can be refreshed. It never includes the credential value.
+- **Resolved capability**: operation-time, non-secret plan produced from a
+  resolved provider definition plus the current credential shape. It names
+  the effective authentication mode, API surface, and base URL for either
+  inference or discovery.
+- **Provider backend**: provider-level runtime object that owns the resolved
+  definition and the shared policy for resolving fresh credentials. It does
+  not retain one token forever.
 - **Inference client**: the existing `AnyClient`; an authenticated client that
   creates model handles and sends inference requests.
 - **Model handle**: the existing `AnyModel`; an inference client bound to one
@@ -91,13 +100,22 @@ adapter selected from ProviderKind
 Vec<ModelCatalogEntry>
 ```
 
-The two paths independently resolve overlapping concerns:
+The two paths independently resolve overlapping concerns. In the current
+branch, `create_catalog_transport_with_auth` re-derives substantial behavior
+already owned by inference construction, including:
 
 - provider kind and alias;
 - effective authentication mode;
 - credentials and custom headers;
 - base URL and transport policy;
 - which concrete API behavior to use.
+- authentication-kind safety guards;
+- OAuth-specific endpoint overrides and beta/account headers;
+- provider default base URLs.
+
+This is not merely similar code. It is duplicated policy: a future inference
+authentication change can succeed while discovery silently retains the old
+headers, endpoint, or credential precedence.
 
 This creates two risks:
 
@@ -107,14 +125,21 @@ This creates two risks:
    identity, authentication, inference surface, and discovery surface are
    related but are not the same concept.
 
+The current adapter dispatch makes the second risk concrete. It handles a
+small set of provider kinds explicitly and routes every remaining kind through
+the OpenAI-compatible discovery parser. That makes an implicit compatibility
+claim for custom and future provider kinds. A separate discovery-surface
+decision turns that wildcard assumption into an explicit, reviewable choice.
+
 The problem is not that inference hides its concrete API surface. Hiding it
 is desirable. The problem is that discovery cannot reuse the provider-level
 decision that inference already made.
 
 ## Design goals
 
-1. Resolve provider identity, authentication mode, endpoints, and API
-   surfaces once through one authoritative path.
+1. Resolve stable provider identity and policy once through one authoritative
+   path, then resolve current credential shape and operation-specific API
+   surfaces through that same policy at operation time.
 2. Keep inference and discovery as separate, narrow capabilities.
 3. Keep provider-specific wire formats below provider-neutral interfaces.
 4. Prevent credentials from entering catalog records, UI state, cache keys,
@@ -139,26 +164,38 @@ decision that inference already made.
 
 ## Proposed architecture
 
-Introduce one provider-level resolution and two sibling capabilities:
+Introduce one stable provider definition, one shared credential-resolution
+policy, and two sibling capabilities. Credential values are resolved at the
+moment an operation needs them:
 
 ```text
-                    merged provider configuration
-                               |
-                               v
-                     resolve_provider_backend
-                               |
-                               v
-                      ProviderBackend
-                     /               \
-                    /                 \
-                   v                   v
-          inference_client()       model_discovery()
-                   |                   |
-                   v                   v
-              AnyClient          ModelDiscoveryClient
-                   |                   |
-                   v                   v
-              AnyModel          Vec<DiscoveredModel>
+                 merged provider configuration
+                              |
+                              v
+             ResolvedProviderDefinition
+                              |
+                              v
+                     ProviderBackend
+              (definition + credential policy)
+                    /                     \
+                   /                       \
+                  v                         v
+       inference_client()              model_discovery()
+                  |                         |
+                  +---- resolve current ----+
+                        credential shape
+                        and fresh secret
+                              |
+                  +-----------+------------+
+                  |                        |
+                  v                        v
+       ResolvedInference          ResolvedDiscovery
+                  |                        |
+                  v                        v
+             AnyClient           ModelDiscoveryClient
+                  |                        |
+                  v                        v
+             AnyModel            Vec<DiscoveredModel>
                                            |
                                            v
                                     application catalog
@@ -169,27 +206,57 @@ Introduce one provider-level resolution and two sibling capabilities:
 
 The important property is not whether the implementation uses traits or
 enums. It is that both capabilities originate from the same resolved provider
-description and credential policy.
+definition and credential policy. They share the rules, not a token captured
+at backend-construction time.
 
-### Resolved provider
+### Two-stage resolution
 
-Add a non-secret descriptor similar to:
+Provider resolution has a stable stage and an operation-time stage.
+
+The stable stage validates configuration and records policy without reading or
+retaining secret values:
 
 ```rust
-pub struct ResolvedProvider {
+pub struct ResolvedProviderDefinition {
     pub alias: String,
     pub kind: ProviderKind,
-    pub auth_mode: ProviderAuth,
-    pub inference_surface: InferenceSurface,
-    pub discovery_surface: DiscoverySurface,
-    pub inference_base_url: String,
-    pub discovery_base_url: Option<String>,
+    pub configured_auth: Option<ProviderAuth>,
+    pub configured_base_url: Option<String>,
+    pub credential_policy: CredentialPolicy,
 }
 ```
 
-The exact fields may change during implementation, but the descriptor must
-distinguish provider identity from the operations used to communicate with
-it. Inference and discovery URLs are separate because a provider is not
+The operation-time stage asks the shared credential resolver for both a fresh
+secret and its non-secret shape, then derives the effective surface and URL:
+
+```rust
+pub struct CredentialShape {
+    pub kind: CredentialKind,
+    pub refreshable: bool,
+}
+
+pub struct ResolvedInference {
+    pub auth_mode: ProviderAuth,
+    pub inference_surface: InferenceSurface,
+    pub inference_base_url: String,
+    // Secret-bearing credential stays private to construction.
+}
+
+pub struct ResolvedDiscovery {
+    pub auth_mode: ProviderAuth,
+    pub discovery_surface: DiscoverySurface,
+    pub discovery_base_url: Option<String>,
+    // Secret-bearing credential stays private to construction.
+}
+```
+
+The exact fields may change during implementation. The required ordering does
+not: effective surface and base URL are derived from provider policy plus the
+current credential shape. This accommodates existing behavior in which
+credential presence or kind affects authentication mode, endpoint choice, or
+wire behavior, while keeping secret values out of ordinary descriptors.
+
+Inference and discovery URLs remain distinct because a provider is not
 required to expose both operations under the same base path.
 
 Example surface enums:
@@ -215,35 +282,56 @@ pub enum DiscoverySurface {
 These names describe wire behavior, not provider brands. Multiple provider
 aliases may legitimately use the same surface.
 
-`ResolvedProvider` must not contain raw API keys, access tokens, or refresh
-tokens. Credential resolution should produce a protected internal handle used
-only when constructing a concrete capability. Secret-bearing types must have
-redacted `Debug` implementations or no `Debug` implementation.
+`ResolvedProviderDefinition`, `CredentialShape`, and resolved capability
+metadata must not contain raw API keys, access tokens, or refresh tokens.
+Secret-bearing values exist only inside the operation-time construction path.
+Secret-bearing types must have redacted `Debug` implementations or no `Debug`
+implementation.
 
 ### Provider backend
 
-`ProviderBackend` is the provider-centred interface. It owns the resolved
-description and access to protected credentials, and lazily creates only the
-capability a caller needs:
+`ProviderBackend` is the provider-centred interface. It owns the stable
+definition and a shared credential-resolution policy, then lazily creates only
+the capability a caller needs:
 
 ```rust
 pub struct ProviderBackend {
-    resolved: ResolvedProvider,
-    credentials: CredentialHandle,
+    definition: ResolvedProviderDefinition,
+    credentials: CredentialResolver,
 }
 
 impl ProviderBackend {
-    pub fn descriptor(&self) -> &ResolvedProvider;
+    pub fn descriptor(&self) -> &ResolvedProviderDefinition;
     pub fn inference_client(&self) -> anyhow::Result<AnyClient>;
     pub fn model_discovery(&self) -> anyhow::Result<ModelDiscoveryClient>;
 }
 ```
 
-`CredentialHandle` is illustrative. The implementation may instead retain
-private resolver callbacks or provider-specific refreshable credential
-objects. The invariant is more important than the concrete type: inference
-and discovery must use the same effective authentication decision and safety
-policy.
+`CredentialResolver` is illustrative and represents policy, not one resolved
+token. Each capability method resolves credentials at operation time. That is
+required for refreshable OAuth credentials and sparse operations: a discovery
+call may occur long after backend construction or after a 15-minute catalog
+cache interval.
+
+Inference and discovery may receive different fresh token values at different
+times. They must nevertheless use the same precedence rules, credential-kind
+classification, refresh behavior, authentication guards, URL-safety policy,
+and header construction rules.
+
+The operation-time sequence is:
+
+```text
+ProviderBackend method called
+        |
+        v
+resolve current credential and CredentialShape
+        |
+        v
+derive operation surface + base URL + auth/header policy
+        |
+        v
+construct concrete inference or discovery capability
+```
 
 Capability construction should remain lazy:
 
@@ -268,8 +356,8 @@ Provider-specific inference clients and request serialization continue to be
 hidden inside `AnyClient`, `AnyModel`, and existing stream dispatch.
 
 The main change is construction: `AnyClient` should be created from the shared
-`ProviderBackend`/`ResolvedProvider` decision rather than independently
-resolving provider configuration inside `client.rs`.
+`ProviderBackend` definition and operation-time resolution rather than
+independently resolving provider configuration inside `client.rs`.
 
 This proposal does not require renaming `AnyClient`. An eventual rename to
 `InferenceClient` could improve clarity, but it would create broad mechanical
@@ -301,9 +389,11 @@ impl ModelDiscoveryClient {
 }
 ```
 
-An enum matches the existing `AnyClient`/`AnyModel` dispatch style and avoids
-requiring an async-trait dependency. A trait is also reasonable if it makes
-tests or plugin integration materially cleaner.
+Use enum dispatch for the initial implementation. It matches the existing
+`AnyClient`/`AnyModel` house style, keeps supported adapters explicit, and
+avoids requiring an async-trait dependency. A trait can be reconsidered only
+if a concrete plugin or testing requirement cannot be expressed cleanly
+through the enum.
 
 `list_models` owns provider-specific HTTP calls, pagination, response limits,
 and response parsing. It returns normalized live results only. It does not
@@ -320,6 +410,11 @@ An optional `get_model(id)` operation can be added later if a provider API can
 retrieve richer metadata efficiently. It should not be added until there is a
 real consumer; `list_models` is sufficient for this refactor.
 
+Adapters should preserve current pagination behavior during the refactor. A
+future behavior change may return successfully collected pages plus a notice
+when a provider exceeds a pagination bound, rather than discarding all pages.
+That change belongs entirely inside discovery and is intentionally deferred.
+
 ### Application catalog
 
 `provider::catalog` remains the provider-neutral aggregation layer:
@@ -335,19 +430,38 @@ ModelDiscoveryClient::list_models()
                   Vec<ModelCatalogEntry>
 ```
 
-This layer owns concurrency, cache freshness, stale fallback, deduplication,
-source precedence, ranking, and notices. It does not construct authentication
-headers or select provider-specific response adapters.
+Before starting discovery, this layer also owns **provider enumeration**. It
+decides which aliases should be queried by combining application policy such
+as:
 
-Cache identity should be based on a non-secret discovery fingerprint such as:
+- provider aliases present in merged configuration;
+- the active provider alias;
+- built-in aliases whose supported credential sources are present.
+
+This is distinct from resolving one alias. `ProviderBackend` answers "how do I
+operate this provider?" while the application catalog answers "which
+providers should participate in this catalog load?" Keeping enumeration here
+prevents it from being duplicated in provider construction or the TUI.
+
+The catalog layer therefore owns enumeration, concurrency, cache freshness,
+stale fallback, deduplication, source precedence, ranking, and notices. It does
+not construct authentication headers or select provider-specific response
+adapters.
+
+For this behavior-preserving refactor, retain the current lowercased-alias
+cache key. Provider configuration is immutable for the life of the process,
+so a more detailed fingerprint does not fix a current collision.
+
+A future runtime-config-reload feature should replace the alias key with a
+non-secret discovery fingerprint such as:
 
 ```text
 provider alias + provider kind + discovery surface + discovery base URL + auth mode
 ```
 
-No credential material should enter the key. The fingerprint prevents a
-catalog obtained through one resolved backend from being reused after a
-material provider configuration change in the same process.
+No credential material should enter such a future key. Deferring the change
+keeps cache semantics stable during this refactor and avoids presenting
+defensive future-proofing as a current bug fix.
 
 ### TUI and route switching
 
@@ -380,8 +494,10 @@ atomic installation behavior.
 | Concern | Owner |
 |---|---|
 | Merge global/project provider configuration | `config` |
-| Resolve alias, kind, auth mode, endpoints, and surfaces | provider backend resolver |
-| Resolve and protect credentials | provider backend/auth layer |
+| Select which aliases participate in a catalog load | `provider::catalog` |
+| Resolve stable alias, kind, configured endpoints, and credential policy | provider backend resolver |
+| Resolve fresh credentials and credential shape per operation | provider backend/auth layer |
+| Derive operation-specific auth mode, endpoint, and surface | provider backend resolver |
 | Build inference client | provider backend + `client` |
 | Create a model handle | `AnyClient` |
 | Send/stream inference | `AnyModel` and stream dispatch |
@@ -396,7 +512,7 @@ The exact layout is negotiable, but a reviewable decomposition would be:
 
 ```text
 src/provider/
-  backend.rs             ResolvedProvider, surfaces, ProviderBackend factory
+  backend.rs             stable definition, capability plans, surfaces, factory
   client.rs              inference-client construction from ProviderBackend
   discovery/
     mod.rs               DiscoveredModel and ModelDiscoveryClient dispatch
@@ -423,21 +539,28 @@ Each phase should preserve behavior and be independently testable.
   definitions to concrete inference-client variants.
 - Add equivalent characterization tests for current discovery transports and
   adapters.
-- Record base URLs, auth modes, headers-by-presence, and surface choices
-  without snapshotting secrets.
+- Record credential source/shape, base URLs, auth modes, headers-by-presence,
+  and surface choices without snapshotting secrets.
+- Cover cases where credential presence or kind changes effective auth,
+  endpoint, or concrete client variant.
 
 Acceptance: tests describe current behavior before structural movement.
 
-### Phase 2 — Introduce resolved-provider types
+### Phase 2 — Introduce provider-definition and capability types
 
-- Add `ResolvedProvider`, `InferenceSurface`, and `DiscoverySurface`.
+- Add `ResolvedProviderDefinition`, `CredentialShape`, resolved capability
+  plans, `InferenceSurface`, and `DiscoverySurface`.
 - Extract one authoritative resolver from the overlapping logic in
   `create_client_with_auth` and `create_catalog_transport_with_auth`.
+- Split stable config validation from operation-time credential resolution;
+  do not attempt to finalize surfaces or base URLs before credential shape is
+  known.
 - Preserve existing validation, URL-safety, header, OAuth-refresh, and
   credential-precedence behavior.
 
-Acceptance: the new resolver produces descriptors matching the Phase 1
-characterization matrix; no callers change behavior yet.
+Acceptance: the stable definition plus operation-time resolver produce
+capability plans matching the Phase 1 characterization matrix; no callers
+change behavior yet.
 
 ### Phase 3 — Move inference construction behind ProviderBackend
 
@@ -447,6 +570,9 @@ characterization matrix; no callers change behavior yet.
   wrappers while migrating call sites.
 - Verify startup, role clients, session switching, plugin switching, and
   `/model <id>` still choose the same concrete clients.
+- Replace role-vs-active comparisons that manufacture
+  `ProviderEntry::default()` merely to satisfy an old tuple shape. Compare the
+  live resolved alias with the role alias directly.
 
 Acceptance: inference tests and client-variant characterization tests remain
 unchanged.
@@ -465,9 +591,12 @@ Acceptance: existing fixture tests produce equivalent normalized live rows.
 
 - Change `provider::catalog` to request discovery capabilities from resolved
   provider backends.
+- Keep `discovery_aliases` (or its successor) in the catalog layer as the one
+  owner of provider-enumeration policy.
 - Remove provider-specific adapter selection and credential construction from
   the aggregation layer.
-- Key caches by the non-secret discovery fingerprint.
+- Preserve the current lowercased-alias cache key; defer a richer fingerprint
+  until runtime provider configuration can actually change.
 
 Acceptance: ordering, merging, notices, caching, and partial-failure behavior
 remain stable.
@@ -478,25 +607,33 @@ remain stable.
 - Remove wrappers that no longer have callers.
 - Document the provider-backend extension point for future adapters.
 
-Acceptance: one authoritative provider resolution feeds both capabilities,
-and provider-specific discovery code is unreachable from the TUI.
+Acceptance: one authoritative stable definition and one operation-time
+credential/surface resolution policy feed both capabilities, and
+provider-specific discovery code is unreachable from the TUI.
 
 ## Invariants
 
 The refactor is complete only if these invariants hold:
 
-1. A provider alias is resolved once per backend construction.
-2. Inference and discovery cannot independently choose conflicting auth modes
-   or endpoints for the same backend.
-3. Provider-specific JSON never reaches the TUI.
-4. Raw credentials never enter catalog entries, cache keys, notices, or logs.
-5. Discovery is lazy, cancellable by dropping its task, bounded by timeout and
+1. Stable provider configuration is validated once per backend construction.
+2. Credentials are resolved at operation time, not frozen when the backend is
+   constructed.
+3. Inference and discovery share credential precedence, credential-kind
+   classification, refresh, auth-guard, URL-safety, and header policies.
+4. Effective surfaces and base URLs are derived only after current credential
+   shape is known.
+5. Provider enumeration has one owner in the application catalog.
+6. Provider-specific JSON never reaches the TUI.
+7. Raw credentials never enter provider descriptors, catalog entries, cache
+   keys, notices, or logs.
+8. Discovery is lazy, cancellable by dropping its task, bounded by timeout and
    response-size limits, and isolated per provider.
-6. A discovery failure never mutates the active inference route.
-7. Route installation remains atomic.
-8. Providers without live discovery retain configured/current/suggested
+9. A discovery failure never mutates the active inference route.
+10. Route installation remains atomic.
+11. Providers without live discovery retain configured/current/suggested
    catalog behavior.
-9. The abstraction refactor changes no provider-specific behavior by itself.
+12. The abstraction refactor changes no provider-specific behavior or cache
+    identity by itself.
 
 ## Test strategy
 
@@ -504,10 +641,12 @@ The refactor is complete only if these invariants hold:
 
 - Provider alias and `provider_type` resolution.
 - Effective authentication selection.
+- Credential-presence/kind cases that affect the operation plan.
 - Inference and discovery surface selection.
 - Separate inference/discovery base URLs.
 - Custom-header and URL-safety policy preservation.
 - Missing or invalid credential errors remain actionable and secret-free.
+- Safe provider descriptors never contain raw credential values.
 
 ### Inference parity tests
 
@@ -516,14 +655,19 @@ The refactor is complete only if these invariants hold:
 - Default and explicit model handling is unchanged.
 - Role clients and the active route use the shared resolver.
 - OAuth refresh and billing-fallback behavior remain unchanged.
+- A credential refreshed after backend construction is used by a later
+  inference-client construction.
 
 ### Discovery parity tests
 
 - Existing response fixtures produce the same normalized model metadata.
 - Pagination, timeouts, body limits, and malformed responses behave as before.
 - One provider failure does not suppress successful providers.
-- Cache fingerprints change when a non-secret discovery-relevant setting
-  changes and remain stable otherwise.
+- Configured, active, and credentialed built-in alias enumeration remains
+  equivalent to current behavior.
+- A credential refreshed after backend construction is used by a later
+  discovery operation.
+- Existing lowercased-alias cache behavior remains unchanged.
 
 ### Boundary tests
 
@@ -532,25 +676,31 @@ The refactor is complete only if these invariants hold:
 - Inference construction does not populate application catalog entries.
 - Debug/error formatting cannot reveal credentials.
 
-## Open design questions for review
+## Design decisions after review
 
-1. Should `ProviderBackend` be a struct with surface enums, or an enum whose
-   variants encode fully resolved backend combinations?
-2. Should `ModelDiscoveryClient` use enum dispatch, a trait, or a small
-   function object?
-3. Should the current `AnyClient` name remain, or should a later mechanical
-   change rename it to `InferenceClient`?
-4. Should surface selection eventually become configurable, or remain derived
-   from provider type and authentication until a concrete use case requires a
-   config field?
-5. Should discovery and inference share one protected credential handle, or
-   independently request credentials through the same resolver so refresh can
-   occur at operation time?
-6. Which non-secret fields are sufficient for a correct in-process discovery
-   cache fingerprint?
+The initial review resolves the major shape questions as follows:
 
-These questions should be resolved on architectural grounds before adding new
-provider-specific discovery behavior.
+1. **Use a `ProviderBackend` struct plus surface enums.** An enum containing
+   every fully resolved provider/auth/surface combination would grow
+   combinatorially and obscure the fact that many aliases share wire
+   surfaces.
+2. **Use enum dispatch for `ModelDiscoveryClient`.** This matches
+   `AnyClient`/`AnyModel`, makes wildcard compatibility assumptions visible,
+   and avoids a new async-trait dependency.
+3. **Keep the `AnyClient` name.** Treat it as the inference client in design
+   discussion; a broad rename is unrelated mechanical churn.
+4. **Derive surfaces internally.** Do not add a configuration field until a
+   concrete user requirement needs one.
+5. **Resolve credentials at operation time.** Inference and discovery share
+   one resolution policy, not one token value captured during backend
+   construction.
+6. **Preserve alias-only cache identity.** A richer non-secret fingerprint is
+   deferred until provider configuration can change during a process.
+
+Implementation still has freedom over private type names, whether the
+credential resolver is a struct or function object, and whether discovery
+adapters begin in one file or several. Those choices must preserve the
+decisions and invariants above.
 
 ## Review criteria
 
