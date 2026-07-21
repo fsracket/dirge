@@ -298,7 +298,10 @@ fn paint_picker_overlay(
                 .selected
                 .saturating_sub(n / 2)
                 .min(picker.rows.len().saturating_sub(n));
-            for i in start..(start + n) {
+            // `lines` is painted bottom-up below, so store the visible rows in
+            // reverse order. Picker index 0 then appears at the top and index
+            // growth moves downward, matching Up/Down key semantics.
+            for i in (start..(start + n)).rev() {
                 let marker = if i == picker.selected { "▸ " } else { "  " };
                 let style = if i == picker.selected { accent } else { dim };
                 lines.push((format!("{marker}{}", picker.rows[i]), style));
@@ -708,6 +711,13 @@ mod tests {
         assert!(
             dumped.contains("▸ src/lib.rs"),
             "selected row + marker missing"
+        );
+        let main_y = dumped.find("src/main.rs").expect("first row");
+        let lib_y = dumped.find("src/lib.rs").expect("second row");
+        let cargo_y = dumped.find("Cargo.toml").expect("third row");
+        assert!(
+            main_y < lib_y && lib_y < cargo_y,
+            "picker rows must be painted top-to-bottom in index order"
         );
     }
 

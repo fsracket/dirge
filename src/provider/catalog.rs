@@ -69,14 +69,11 @@ pub async fn load_model_catalog(
     active_model: String,
     force_refresh: bool,
 ) -> ModelCatalog {
-    let mut aliases: Vec<String> = providers.keys().cloned().collect();
-    if !aliases
-        .iter()
-        .any(|alias| alias.eq_ignore_ascii_case(&active_provider))
-    {
-        aliases.push(active_provider.clone());
-    }
-    aliases.sort_by_key(|alias| alias.to_ascii_lowercase());
+    let aliases = discovery_aliases(
+        &providers,
+        &active_provider,
+        super::providers_with_api_keys(),
+    );
 
     let futures = aliases.iter().cloned().map(|alias| {
         let providers = providers.clone();
@@ -143,6 +140,24 @@ pub async fn load_model_catalog(
             .then_with(|| a.id.to_ascii_lowercase().cmp(&b.id.to_ascii_lowercase()))
     });
     ModelCatalog { entries, notices }
+}
+
+fn discovery_aliases<'a>(
+    providers: &HashMap<String, ProviderEntry>,
+    active_provider: &'a str,
+    credentialed_builtins: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    let mut aliases: Vec<String> = providers.keys().cloned().collect();
+    for alias in std::iter::once(active_provider).chain(credentialed_builtins) {
+        if !aliases
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(alias))
+        {
+            aliases.push(alias.to_string());
+        }
+    }
+    aliases.sort_by_key(|alias| alias.to_ascii_lowercase());
+    aliases
 }
 
 fn rank(
@@ -567,5 +582,22 @@ mod tests {
             ),
             3
         );
+    }
+
+    #[test]
+    fn discovery_includes_every_credentialed_builtin_without_config_entries() {
+        let aliases = discovery_aliases(
+            &HashMap::new(),
+            "deepseek",
+            ["deepseek", "openrouter", "gemini"],
+        );
+        assert_eq!(aliases, ["deepseek", "gemini", "openrouter"]);
+    }
+
+    #[test]
+    fn discovery_preserves_named_aliases_and_deduplicates_case_insensitively() {
+        let providers = HashMap::from([("My-Router".to_string(), ProviderEntry::default())]);
+        let aliases = discovery_aliases(&providers, "my-router", ["openrouter"]);
+        assert_eq!(aliases, ["My-Router", "openrouter"]);
     }
 }

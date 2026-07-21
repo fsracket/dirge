@@ -561,6 +561,14 @@ pub fn auto_detect_provider() -> Option<&'static str> {
     auto_detect_provider_from(|name| std::env::var(name).ok())
 }
 
+/// Every built-in provider whose conventional API-key environment variable is
+/// present. Startup uses only the first one as its active route, while catalog
+/// discovery uses the complete set so `/model` can browse all available
+/// providers without requiring a redundant `providers` config block.
+pub fn providers_with_api_keys() -> Vec<&'static str> {
+    providers_with_api_keys_from(|name| std::env::var(name).ok())
+}
+
 /// Provider candidate list for autodetect. Listed in priority
 /// order — first key with a non-empty value wins. Extracted as a
 /// module item so tests reference the same source of truth and
@@ -589,14 +597,22 @@ pub(crate) const PROVIDER_AUTODETECT_ORDER: &[(&str, &str)] = &[
 pub(crate) fn auto_detect_provider_from<F: Fn(&str) -> Option<String>>(
     env: F,
 ) -> Option<&'static str> {
+    providers_with_api_keys_from(env).into_iter().next()
+}
+
+pub(crate) fn providers_with_api_keys_from<F: Fn(&str) -> Option<String>>(
+    env: F,
+) -> Vec<&'static str> {
+    let mut providers = Vec::new();
     for (env_var, provider_name) in PROVIDER_AUTODETECT_ORDER {
         if let Some(v) = env(env_var)
             && !v.is_empty()
+            && !providers.contains(provider_name)
         {
-            return Some(provider_name);
+            providers.push(*provider_name);
         }
     }
-    None
+    providers
 }
 
 /// Provider implied by a stored `dirge auth` OAuth login. Consulted

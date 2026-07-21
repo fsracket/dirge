@@ -44,6 +44,21 @@ fn auto_detect_returns_first_match_in_order() {
     assert_eq!(auto_detect_provider_from(env), Some("deepseek"));
 }
 
+#[test]
+fn catalog_detection_returns_all_keyed_providers_once_in_priority_order() {
+    let env = mock_env(&[
+        ("DEEPSEEK_API_KEY", "sk-ds"),
+        ("GEMINI_API_KEY", "sk-gemini"),
+        ("GLM_API_KEY", "sk-glm"),
+        ("ZHIPU_API_KEY", "sk-zhipu"),
+        ("OPENROUTER_API_KEY", "sk-router"),
+    ]);
+    assert_eq!(
+        providers_with_api_keys_from(env),
+        ["deepseek", "gemini", "glm", "openrouter"]
+    );
+}
+
 /// Cover every provider in the autodetect list — guards
 /// against accidentally dropping or reordering an entry.
 #[test]
