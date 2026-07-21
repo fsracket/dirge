@@ -108,7 +108,7 @@ already owned by inference construction, including:
 - effective authentication mode;
 - credentials and custom headers;
 - base URL and transport policy;
-- which concrete API behavior to use.
+- which concrete API behavior to use;
 - authentication-kind safety guards;
 - OAuth-specific endpoint overrides and beta/account headers;
 - provider default base URLs.
@@ -250,6 +250,11 @@ pub struct ResolvedDiscovery {
 }
 ```
 
+`CredentialKind` is intentionally left as an implementation-defined enum in
+this sketch. Phase 1 characterization should determine the minimum variants
+needed to preserve current credential-source distinctions; the reference here
+is deliberate, not an omitted provider list.
+
 The exact fields may change during implementation. The required ordering does
 not: effective surface and base URL are derived from provider policy plus the
 current credential shape. This accommodates existing behavior in which
@@ -297,7 +302,6 @@ the capability a caller needs:
 ```rust
 pub struct ProviderBackend {
     definition: ResolvedProviderDefinition,
-    credentials: CredentialResolver,
 }
 
 impl ProviderBackend {
@@ -307,11 +311,23 @@ impl ProviderBackend {
 }
 ```
 
-`CredentialResolver` is illustrative and represents policy, not one resolved
-token. Each capability method resolves credentials at operation time. That is
-required for refreshable OAuth credentials and sparse operations: a discovery
-call may occur long after backend construction or after a 15-minute catalog
-cache interval.
+`CredentialPolicy` has one home: `ResolvedProviderDefinition`. It is a stable,
+non-secret recipe for applying credential precedence and obtaining current
+credentials; it is not one resolved token. `ProviderBackend` invokes that
+policy when constructing either capability, conceptually
+`self.definition.credential_policy.resolve_now()`.
+
+Each capability method therefore resolves credentials at operation time. That
+is required for refreshable OAuth credentials and sparse operations: a
+discovery call may occur long after backend construction or after a 15-minute
+catalog cache interval.
+
+For inference, **operation time means inference-client construction**. A built
+`AnyClient` retains the credentials and refresh behavior of its concrete
+variant for the life of that active route, exactly as it does today. This
+refactor does not introduce per-prompt credential re-resolution. Constructing
+a later replacement `AnyClient` consults `CredentialPolicy` again and can use
+newly refreshed credentials.
 
 Inference and discovery may receive different fresh token values at different
 times. They must nevertheless use the same precedence rules, credential-kind
@@ -616,8 +632,9 @@ provider-specific discovery code is unreachable from the TUI.
 The refactor is complete only if these invariants hold:
 
 1. Stable provider configuration is validated once per backend construction.
-2. Credentials are resolved at operation time, not frozen when the backend is
-   constructed.
+2. Credentials are resolved when constructing an inference or discovery
+   capability, not frozen when the backend is constructed. Inference does not
+   re-resolve credentials for every prompt.
 3. Inference and discovery share credential precedence, credential-kind
    classification, refresh, auth-guard, URL-safety, and header policies.
 4. Effective surfaces and base URLs are derived only after current credential
