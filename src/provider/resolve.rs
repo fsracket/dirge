@@ -10,9 +10,9 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use crate::config::{Config, ProviderAuth, ProviderEntry};
+use crate::config::{Config, ProviderEntry};
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderKind {
     OpenRouter,
     OpenAI,
@@ -254,21 +254,27 @@ fn kind_label(kind: ProviderKind) -> &'static str {
     }
 }
 
-pub struct ProviderInfo {
-    pub kind: ProviderKind,
-    pub base_url: Option<String>,
-    pub api_key_env: Option<String>,
-    pub auth: Option<ProviderAuth>,
-    /// Literal API key resolved from `entry.api_key` (with `${VAR}`
-    /// already expanded). When present, takes precedence over both
-    /// `api_key_env` and the standard env-var fallback chain.
-    pub api_key_literal: Option<String>,
+/// Return the configured entry that supplies a provider alias. User config
+/// wins over plugin registration; built-ins without an explicit entry return
+/// `None`. Secret-bearing fields stay inside this private operation-time
+/// lookup and are never copied into the stable provider descriptor.
+pub(crate) fn resolve_provider_entry(
+    name: &str,
+    providers: &HashMap<String, ProviderEntry>,
+) -> Option<ProviderEntry> {
+    let lower = name.to_ascii_lowercase();
+    providers
+        .get(name)
+        .or_else(|| providers.get(&lower))
+        .cloned()
+        .or_else(|| plugin_provider(name))
+        .or_else(|| plugin_provider(&lower))
 }
 
 pub fn resolve_provider_info(
     name: &str,
     providers: &HashMap<String, ProviderEntry>,
-) -> Option<ProviderInfo> {
+) -> Option<super::backend::ResolvedProviderDefinition> {
     // Config-declared providers win on name collision — user intent
     // always trumps plugin defaults.
     // #2 fix: lowercase-fallback lookup so `--provider My-VLLM` finds
@@ -305,27 +311,17 @@ pub fn resolve_provider_info(
             eprintln!("error: {err}");
             return None;
         }
-        let api_key_literal = match entry.resolved_api_key() {
-            Some(Ok(k)) => Some(k),
-            Some(Err(missing)) => {
-                tracing::error!(
-                    target: "dirge::provider",
-                    "provider '{name}' references env var ${{{missing}}} via api_key but it is unset",
-                );
-                eprintln!(
-                    "error: provider '{name}' references env var ${{{missing}}} via api_key but it is unset"
-                );
-                None
-            }
-            None => None,
-        };
-        return Some(ProviderInfo {
+        return Some(super::backend::ResolvedProviderDefinition::new(
+            name,
             kind,
-            base_url: entry.base_url.clone(),
-            api_key_env: entry.api_key_env.clone(),
-            auth: entry.auth,
-            api_key_literal,
-        });
+            entry.base_url.clone(),
+            entry.api_key_env.clone(),
+            entry.auth,
+            entry
+                .headers
+                .as_ref()
+                .is_some_and(|headers| !headers.is_empty()),
+        ));
     }
     // Then plugin-registered providers from `harness/register-provider`.
     // Installed once at startup after plugin load; never mutated again
@@ -351,36 +347,22 @@ pub fn resolve_provider_info(
             eprintln!("error: {err}");
             return None;
         }
-        let api_key_literal = match entry.resolved_api_key() {
-            Some(Ok(k)) => Some(k),
-            Some(Err(missing)) => {
-                tracing::error!(
-                    target: "dirge::provider",
-                    "plugin provider '{name}' references env var ${{{missing}}} via api_key but it is unset",
-                );
-                eprintln!(
-                    "error: plugin provider '{name}' references env var ${{{missing}}} via api_key but it is unset"
-                );
-                None
-            }
-            None => None,
-        };
-        return Some(ProviderInfo {
+        return Some(super::backend::ResolvedProviderDefinition::new(
+            name,
             kind,
-            base_url: entry.base_url,
-            api_key_env: entry.api_key_env,
-            auth: entry.auth,
-            api_key_literal,
-        });
+            entry.base_url,
+            entry.api_key_env,
+            entry.auth,
+            entry
+                .headers
+                .as_ref()
+                .is_some_and(|headers| !headers.is_empty()),
+        ));
     }
     let kind = parse_provider(name)?;
-    Some(ProviderInfo {
-        kind,
-        base_url: None,
-        api_key_env: None,
-        auth: None,
-        api_key_literal: None,
-    })
+    Some(super::backend::ResolvedProviderDefinition::new(
+        name, kind, None, None, None, false,
+    ))
 }
 
 /// Built-in provider names — custom/plugin providers are rejected
@@ -665,7 +647,7 @@ pub(crate) fn provider_env_var_fallbacks(kind: ProviderKind) -> &'static [&'stat
         // header + oauth beta + payload shaping that
         // AnthropicHttpClient adds, so sending it as an API key is
         // rejected. Its presence now implies ProviderAuth::Anthropic
-        // (see client.rs `effective_auth`), routing it through
+        // (see backend.rs `effective_auth`), routing it through
         // `resolve_anthropic_auth`. So it must NOT be an API-key
         // fallback here (was `&["ANTHROPIC_OAUTH_TOKEN"]`).
         ProviderKind::Anthropic => &[],

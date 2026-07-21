@@ -1813,7 +1813,7 @@ fn test_plugin_provider_visible_through_resolve_provider_info() {
             info.base_url.as_deref(),
             Some("http://plugin-test.invalid/v1"),
         );
-        assert_eq!(info.api_key_env.as_deref(), Some("PLUGIN_TEST_KEY"));
+        assert_eq!(info.api_key_env(), Some("PLUGIN_TEST_KEY"));
     }
     // Else: another test already won the OnceLock race; integration
     // isn't observable from here. That's fine — the harness-side

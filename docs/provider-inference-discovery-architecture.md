@@ -1,6 +1,14 @@
 # Provider Inference and Model Discovery — Architecture Sketch
 
-Status: revised proposal after independent review
+Status: implemented on `codex/model-catalog-picker`
+
+Implementation: `provider::backend` owns stable provider definitions and
+operation-time capability resolution; `provider::client` constructs inference
+clients from resolved inference plans; `provider::discovery` owns normalized
+live model listing; and `provider::catalog` retains application enumeration,
+caching, merging, ranking, and notices. Add future wire adapters by extending
+the discovery surface and `ModelDiscoveryClient` enum without adding provider
+conditionals to the catalog or TUI.
 
 ## Purpose
 

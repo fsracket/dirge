@@ -1,20 +1,14 @@
-//! Provider-neutral model discovery, merging, and process-local caching.
+//! Provider-neutral model discovery aggregation, merging, and caching.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use futures::StreamExt;
-use serde_json::Value;
-
 use crate::config::{ProviderAuth, ProviderEntry};
 
-use super::client::{CatalogTransport, create_catalog_transport_with_auth};
-use super::{ProviderKind, default_model_for_alias};
+use super::{DiscoveredModel, ProviderBackend, default_model_for_alias};
 
 const CACHE_TTL: Duration = Duration::from_secs(15 * 60);
-const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
-const MAX_PAGES: usize = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CatalogSource {
@@ -60,8 +54,8 @@ struct CachedProvider {
 
 static CACHE: OnceLock<Mutex<HashMap<String, CachedProvider>>> = OnceLock::new();
 
-/// Discover every configured provider concurrently, retaining successful
-/// partial results and deterministic local fallbacks when endpoints fail.
+/// Enumerate and discover providers concurrently, retaining successful partial
+/// results and deterministic local fallbacks when individual endpoints fail.
 pub async fn load_model_catalog(
     providers: HashMap<String, ProviderEntry>,
     default_auth: Option<ProviderAuth>,
@@ -74,7 +68,6 @@ pub async fn load_model_catalog(
         &active_provider,
         super::providers_with_api_keys(),
     );
-
     let futures = aliases.iter().cloned().map(|alias| {
         let providers = providers.clone();
         async move { fetch_provider_catalog(&alias, &providers, default_auth, force_refresh).await }
@@ -86,14 +79,14 @@ pub async fn load_model_catalog(
     for (alias, result) in aliases.iter().zip(results) {
         match result {
             Ok(found) => entries.extend(found),
-            Err(e) => {
+            Err(error) => {
                 if let Some(stale) = cached(alias, false) {
                     notices.push(format!(
-                        "{alias}: refresh failed ({e}); showing last successful catalog"
+                        "{alias}: refresh failed ({error}); showing last successful catalog"
                     ));
                     entries.extend(stale);
                 } else {
-                    notices.push(format!("{alias}: discovery unavailable ({e})"));
+                    notices.push(format!("{alias}: discovery unavailable ({error})"));
                 }
             }
         }
@@ -142,6 +135,8 @@ pub async fn load_model_catalog(
     ModelCatalog { entries, notices }
 }
 
+/// Application-level provider enumeration remains owned here rather than by
+/// backend resolution or the UI.
 fn discovery_aliases<'a>(
     providers: &HashMap<String, ProviderEntry>,
     active_provider: &'a str,
@@ -192,6 +187,18 @@ fn local_entry(alias: &str, id: &str, source: CatalogSource) -> ModelCatalogEntr
     }
 }
 
+fn remote_entry(alias: &str, discovered: DiscoveredModel) -> ModelCatalogEntry {
+    ModelCatalogEntry {
+        provider_alias: alias.to_string(),
+        id: discovered.id,
+        display_name: discovered.display_name,
+        context_window: discovered.context_window,
+        supports_tools: discovered.supports_tools,
+        supports_images: discovered.supports_images,
+        source: CatalogSource::Remote,
+    }
+}
+
 fn merge_entries(entries: Vec<ModelCatalogEntry>) -> Vec<ModelCatalogEntry> {
     let mut merged: HashMap<(String, String), ModelCatalogEntry> = HashMap::new();
     for incoming in entries {
@@ -234,20 +241,17 @@ async fn fetch_provider_catalog(
     if !force_refresh && let Some(entries) = cached(alias, true) {
         return Ok(entries);
     }
-    let transport = create_catalog_transport_with_auth(alias, providers, default_auth)?;
-    let mut entries = match transport.kind {
-        ProviderKind::Anthropic => fetch_anthropic(&transport).await?,
-        ProviderKind::Gemini => fetch_gemini(&transport).await?,
-        ProviderKind::Ollama => fetch_ollama(&transport).await?,
-        _ => fetch_openai_compatible(&transport).await?,
-    };
-    for entry in &mut entries {
-        entry.provider_alias = alias.to_string();
-    }
+    let discovery = ProviderBackend::new(alias, providers, default_auth)?.model_discovery()?;
+    let entries: Vec<ModelCatalogEntry> = discovery
+        .list_models()
+        .await?
+        .into_iter()
+        .map(|model| remote_entry(alias, model))
+        .collect();
     CACHE
         .get_or_init(Default::default)
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(|error| error.into_inner())
         .insert(
             alias.to_ascii_lowercase(),
             CachedProvider {
@@ -262,213 +266,9 @@ fn cached(alias: &str, fresh_only: bool) -> Option<Vec<ModelCatalogEntry>> {
     let guard = CACHE
         .get_or_init(Default::default)
         .lock()
-        .unwrap_or_else(|e| e.into_inner());
+        .unwrap_or_else(|error| error.into_inner());
     let value = guard.get(&alias.to_ascii_lowercase())?;
     (!fresh_only || value.fetched_at.elapsed() < CACHE_TTL).then(|| value.entries.clone())
-}
-
-async fn fetch_openai_compatible(
-    transport: &CatalogTransport,
-) -> anyhow::Result<Vec<ModelCatalogEntry>> {
-    let json = get_json(transport, format!("{}/models", transport.base_url)).await?;
-    parse_openai_models(&json)
-}
-
-async fn fetch_ollama(transport: &CatalogTransport) -> anyhow::Result<Vec<ModelCatalogEntry>> {
-    let base = transport.base_url.trim_end_matches("/api");
-    let json = get_json(transport, format!("{base}/api/tags")).await?;
-    parse_ollama_models(&json)
-}
-
-fn parse_ollama_models(json: &Value) -> anyhow::Result<Vec<ModelCatalogEntry>> {
-    let rows = json
-        .get("models")
-        .and_then(Value::as_array)
-        .ok_or_else(|| anyhow::anyhow!("response has no models array"))?;
-    Ok(rows
-        .iter()
-        .filter_map(|row| row.get("name").and_then(Value::as_str))
-        .map(|id| remote_entry(id, None, None, None, None))
-        .collect())
-}
-
-async fn fetch_anthropic(transport: &CatalogTransport) -> anyhow::Result<Vec<ModelCatalogEntry>> {
-    let base = transport.base_url.trim_end_matches("/v1");
-    let endpoint = format!("{base}/v1/models");
-    let mut after_id: Option<String> = None;
-    let mut out = Vec::new();
-    for _ in 0..MAX_PAGES {
-        let mut url = reqwest::Url::parse(&endpoint)?;
-        url.query_pairs_mut().append_pair("limit", "100");
-        if let Some(token) = after_id.as_deref() {
-            url.query_pairs_mut().append_pair("after_id", token);
-        }
-        let json = get_json(transport, url).await?;
-        out.extend(parse_anthropic_models(&json)?);
-        if !json
-            .get("has_more")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            return Ok(out);
-        }
-        after_id = Some(
-            json.get("last_id")
-                .and_then(Value::as_str)
-                .filter(|token| !token.is_empty())
-                .ok_or_else(|| anyhow::anyhow!("pagination response omitted last_id"))?
-                .to_string(),
-        );
-    }
-    anyhow::bail!("catalog pagination exceeded {MAX_PAGES} pages")
-}
-
-fn parse_anthropic_models(json: &Value) -> anyhow::Result<Vec<ModelCatalogEntry>> {
-    let rows = json
-        .get("data")
-        .and_then(Value::as_array)
-        .ok_or_else(|| anyhow::anyhow!("response has no data array"))?;
-    Ok(rows
-        .iter()
-        .filter_map(|row| {
-            let id = row.get("id")?.as_str()?;
-            let name = row
-                .get("display_name")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            Some(remote_entry(id, name, None, None, None))
-        })
-        .collect())
-}
-
-async fn fetch_gemini(transport: &CatalogTransport) -> anyhow::Result<Vec<ModelCatalogEntry>> {
-    let base = transport.base_url.trim_end_matches("/v1beta");
-    let mut page_token: Option<String> = None;
-    let mut out = Vec::new();
-    for _ in 0..MAX_PAGES {
-        let mut url = reqwest::Url::parse(&format!("{base}/v1beta/models"))?;
-        url.query_pairs_mut().append_pair("pageSize", "1000");
-        if let Some(token) = page_token.as_deref() {
-            url.query_pairs_mut().append_pair("pageToken", token);
-        }
-        let json = get_json(transport, url).await?;
-        out.extend(parse_gemini_models(&json)?);
-        page_token = json
-            .get("nextPageToken")
-            .and_then(Value::as_str)
-            .filter(|token| !token.is_empty())
-            .map(str::to_string);
-        if page_token.is_none() {
-            return Ok(out);
-        }
-    }
-    anyhow::bail!("catalog pagination exceeded {MAX_PAGES} pages")
-}
-
-fn parse_gemini_models(json: &Value) -> anyhow::Result<Vec<ModelCatalogEntry>> {
-    let rows = json
-        .get("models")
-        .and_then(Value::as_array)
-        .ok_or_else(|| anyhow::anyhow!("response has no models array"))?;
-    Ok(rows
-        .iter()
-        .filter_map(|row| {
-            let methods = row
-                .get("supportedGenerationMethods")
-                .and_then(Value::as_array)?;
-            if !methods
-                .iter()
-                .any(|m| m.as_str() == Some("generateContent"))
-            {
-                return None;
-            }
-            let id = row.get("name")?.as_str()?.trim_start_matches("models/");
-            let name = row
-                .get("displayName")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            let context = row.get("inputTokenLimit").and_then(Value::as_u64);
-            Some(remote_entry(id, name, context, None, None))
-        })
-        .collect())
-}
-
-fn parse_openai_models(json: &Value) -> anyhow::Result<Vec<ModelCatalogEntry>> {
-    let rows = json
-        .get("data")
-        .and_then(Value::as_array)
-        .ok_or_else(|| anyhow::anyhow!("response has no data array"))?;
-    Ok(rows
-        .iter()
-        .filter_map(|row| {
-            let id = row.get("id")?.as_str()?;
-            let name = row
-                .get("name")
-                .or_else(|| row.get("display_name"))
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            let context = row
-                .get("context_length")
-                .or_else(|| row.get("context_window"))
-                .and_then(Value::as_u64);
-            let tools = row
-                .get("supported_parameters")
-                .and_then(Value::as_array)
-                .map(|values| values.iter().any(|v| v.as_str() == Some("tools")));
-            let images = row
-                .pointer("/architecture/input_modalities")
-                .and_then(Value::as_array)
-                .map(|values| values.iter().any(|v| v.as_str() == Some("image")));
-            Some(remote_entry(id, name, context, tools, images))
-        })
-        .collect())
-}
-
-fn remote_entry(
-    id: &str,
-    display_name: Option<String>,
-    context_window: Option<u64>,
-    supports_tools: Option<bool>,
-    supports_images: Option<bool>,
-) -> ModelCatalogEntry {
-    ModelCatalogEntry {
-        provider_alias: String::new(),
-        id: id.to_string(),
-        display_name,
-        context_window,
-        supports_tools,
-        supports_images,
-        source: CatalogSource::Remote,
-    }
-}
-
-async fn get_json(
-    transport: &CatalogTransport,
-    url: impl reqwest::IntoUrl,
-) -> anyhow::Result<Value> {
-    let response = transport.http.get(url).send().await?.error_for_status()?;
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_BODY_BYTES as u64)
-    {
-        anyhow::bail!(
-            "catalog response exceeds {} MiB",
-            MAX_BODY_BYTES / 1024 / 1024
-        )
-    }
-    let mut body = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        if body.len().saturating_add(chunk.len()) > MAX_BODY_BYTES {
-            anyhow::bail!(
-                "catalog response exceeds {} MiB",
-                MAX_BODY_BYTES / 1024 / 1024
-            )
-        }
-        body.extend_from_slice(&chunk);
-    }
-    serde_json::from_slice(&body).map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -476,54 +276,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_openrouter_metadata() {
-        let json = serde_json::json!({"data": [{
-            "id": "anthropic/claude-test",
-            "name": "Claude Test",
-            "context_length": 200000,
-            "supported_parameters": ["tools"],
-            "architecture": {"input_modalities": ["text", "image"]}
-        }]});
-        let rows = parse_openai_models(&json).unwrap();
-        assert_eq!(rows[0].id, "anthropic/claude-test");
-        assert_eq!(rows[0].context_window, Some(200000));
-        assert_eq!(rows[0].supports_tools, Some(true));
-        assert_eq!(rows[0].supports_images, Some(true));
-    }
-
-    #[test]
-    fn parses_anthropic_models() {
-        let rows = parse_anthropic_models(&serde_json::json!({
-            "data": [{"id": "claude-test", "display_name": "Claude Test"}]
-        }))
-        .unwrap();
-        assert_eq!(rows[0].id, "claude-test");
-        assert_eq!(rows[0].display_name.as_deref(), Some("Claude Test"));
-    }
-
-    #[test]
-    fn parses_only_generation_capable_gemini_models() {
-        let rows = parse_gemini_models(&serde_json::json!({"models": [
-            {"name": "models/gemini-test", "displayName": "Gemini Test", "inputTokenLimit": 1000000,
-             "supportedGenerationMethods": ["generateContent"]},
-            {"name": "models/embedding-test", "supportedGenerationMethods": ["embedContent"]}
-        ]}))
-        .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].id, "gemini-test");
-        assert_eq!(rows[0].context_window, Some(1_000_000));
-    }
-
-    #[test]
-    fn parses_ollama_tags() {
-        let rows = parse_ollama_models(&serde_json::json!({
-            "models": [{"name": "qwen3:8b"}, {"name": "llama3.2:latest"}]
-        }))
-        .unwrap();
-        assert_eq!(
-            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
-            ["qwen3:8b", "llama3.2:latest"]
+    fn normalized_discovery_maps_to_remote_catalog_entry() {
+        let row = remote_entry(
+            "router",
+            DiscoveredModel {
+                id: "model-a".into(),
+                display_name: Some("Model A".into()),
+                context_window: Some(200_000),
+                supports_tools: Some(true),
+                supports_images: Some(false),
+            },
         );
+        assert_eq!(row.provider_alias, "router");
+        assert_eq!(row.id, "model-a");
+        assert_eq!(row.source, CatalogSource::Remote);
+        assert_eq!(row.context_window, Some(200_000));
     }
 
     #[test]
@@ -599,5 +366,21 @@ mod tests {
         let providers = HashMap::from([("My-Router".to_string(), ProviderEntry::default())]);
         let aliases = discovery_aliases(&providers, "my-router", ["openrouter"]);
         assert_eq!(aliases, ["My-Router", "openrouter"]);
+    }
+
+    #[test]
+    fn cache_key_remains_lowercased_alias_only() {
+        CACHE
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(
+                "mixed-case".into(),
+                CachedProvider {
+                    fetched_at: Instant::now(),
+                    entries: vec![local_entry("Mixed-Case", "m", CatalogSource::Remote)],
+                },
+            );
+        assert_eq!(cached("MIXED-CASE", true).unwrap()[0].id, "m");
     }
 }

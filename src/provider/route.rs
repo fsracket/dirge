@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use crate::config::{ProviderAuth, ProviderEntry};
 
-use super::{AnyClient, ModelSwitch, create_client_with_auth, resolve_model_name};
+use super::{AnyClient, ModelSwitch, ProviderBackend, resolve_model_name};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveRoute {
@@ -47,7 +47,8 @@ pub fn prepare_active_route(
     default_auth: Option<ProviderAuth>,
 ) -> anyhow::Result<PreparedRoute> {
     let provider_alias = canonical_provider_alias(providers, provider_alias)?;
-    let client = create_client_with_auth(&provider_alias, None, providers, default_auth)?;
+    let client =
+        ProviderBackend::new(&provider_alias, providers, default_auth)?.inference_client(None)?;
     let model_id = resolve_model_name(&client, requested_model, model_explicit);
     Ok(PreparedRoute {
         route: ActiveRoute {

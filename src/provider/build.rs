@@ -319,13 +319,11 @@ pub async fn build_agent(
     // silently disabling — the user asked for a feature and we
     // owe them a clear failure mode.
     if cfg.escalation_provider.is_some() {
-        let default_role = Some((active_provider.to_string(), ProviderEntry::default()));
-        let escalation_role = cfg.resolve_role(crate::config::ConfigRole::Escalation);
-        match (default_role, escalation_role) {
-            (Some((default_alias, _)), Some((escalation_alias, escalation_entry))) => {
+        match cfg.resolve_role(crate::config::ConfigRole::Escalation) {
+            Some((escalation_alias, escalation_entry)) => {
                 // Equal aliases (case-insensitive) → escalation
                 // has no effect; skip the duplicate client.
-                if default_alias.eq_ignore_ascii_case(&escalation_alias) {
+                if active_provider.eq_ignore_ascii_case(&escalation_alias) {
                     tracing::debug!(
                         target: "dirge::provider",
                         alias = %escalation_alias,
@@ -363,7 +361,7 @@ pub async fn build_agent(
                     }
                 }
             }
-            (_, None) => {
+            None => {
                 // escalation_provider was set but resolve_role
                 // returned None — alias doesn't name a present
                 // entry and isn't a built-in. Hard-fail loudly per
@@ -381,10 +379,6 @@ pub async fn build_agent(
                      the `escalation_provider` setting.",
                     alias
                 );
-            }
-            (None, _) => {
-                // Default itself isn't resolvable — let the
-                // caller's "no provider" error path handle it.
             }
         }
     }
@@ -543,11 +537,9 @@ pub async fn build_agent(
     // fallback inside `spawn_review_runner_with_cache` produces an
     // identical request).
     if cfg.review_provider.is_some() {
-        let default_role = Some((active_provider.to_string(), ProviderEntry::default()));
-        let review_role = cfg.resolve_role(crate::config::ConfigRole::Review);
-        match (default_role, review_role) {
-            (Some((default_alias, _)), Some((review_alias, review_entry))) => {
-                if default_alias.eq_ignore_ascii_case(&review_alias) {
+        match cfg.resolve_role(crate::config::ConfigRole::Review) {
+            Some((review_alias, review_entry)) => {
+                if active_provider.eq_ignore_ascii_case(&review_alias) {
                     tracing::debug!(
                         target: "dirge::provider",
                         alias = %review_alias,
@@ -588,7 +580,7 @@ pub async fn build_agent(
                     }
                 }
             }
-            (_, None) => {
+            None => {
                 let alias = cfg.review_provider.as_deref().unwrap_or("(unset)");
                 tracing::warn!(
                     target: "dirge::provider",
@@ -601,10 +593,6 @@ pub async fn build_agent(
                      remove the `review_provider` setting.",
                     alias
                 );
-            }
-            (None, _) => {
-                // Default not resolvable — caller's "no provider"
-                // error path handles it.
             }
         }
     }
