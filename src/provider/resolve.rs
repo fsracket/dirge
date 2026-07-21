@@ -353,10 +353,10 @@ pub fn resolve_provider_info(
             entry.base_url,
             entry.api_key_env,
             entry.auth,
-            entry
-                .headers
-                .as_ref()
-                .is_some_and(|headers| !headers.is_empty()),
+            // Plugin headers were ignored by both inference and discovery
+            // before ProviderBackend. Keep that trust boundary intact; only
+            // user config may contribute arbitrary request headers.
+            false,
         ));
     }
     let kind = parse_provider(name)?;

@@ -107,6 +107,10 @@ impl ResolvedProviderDefinition {
 pub struct ProviderBackend {
     definition: ResolvedProviderDefinition,
     entry: ProviderEntry,
+    /// Preserve the pre-backend boundary: only user-configured providers may
+    /// contribute arbitrary request headers. Plugin entries still contribute
+    /// provider metadata and credential policy, but their headers are ignored.
+    include_entry_headers: bool,
 }
 
 impl ProviderBackend {
@@ -122,9 +126,18 @@ impl ProviderBackend {
             )
         })?;
         definition.auth = definition.auth.or(default_auth);
+        let lower = provider_name.to_ascii_lowercase();
+        let include_entry_headers = providers
+            .get(provider_name)
+            .or_else(|| providers.get(&lower))
+            .is_some();
         let entry =
             super::resolve::resolve_provider_entry(provider_name, providers).unwrap_or_default();
-        Ok(Self { definition, entry })
+        Ok(Self {
+            definition,
+            entry,
+            include_entry_headers,
+        })
     }
 
     #[allow(dead_code)]
@@ -242,7 +255,11 @@ impl ProviderBackend {
         F: Fn(&str) -> Option<String>,
         G: FnOnce() -> anyhow::Result<Option<OpenAiOAuthCredential>>,
     {
-        let mut inference_headers = self.entry.resolved_headers()?;
+        let mut inference_headers = if self.include_entry_headers {
+            self.entry.resolved_headers()?
+        } else {
+            rig::http_client::HeaderMap::new()
+        };
         let anthropic_oauth_env_present =
             env("ANTHROPIC_OAUTH_TOKEN").is_some_and(|value| !value.trim().is_empty());
         let anthropic_oauth_file_present = super::anthropic_oauth::credentials_file_path().exists();
@@ -703,6 +720,44 @@ mod tests {
         assert!(!rendered.contains("SUPER-SECRET"));
         assert!(!rendered.contains("HEADER-SECRET"));
         assert!(backend.descriptor().has_configured_headers);
+        let resolved = backend
+            .resolve_inference_with(None, no_env, || Ok(None), None)
+            .unwrap();
+        assert_eq!(
+            resolved
+                .headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("HEADER-SECRET")
+        );
+    }
+
+    #[test]
+    fn plugin_entry_headers_remain_outside_request_policy() {
+        let definition = ResolvedProviderDefinition::new(
+            "plugin-proxy",
+            ProviderKind::OpenAI,
+            Some("https://plugin.example/v1".to_string()),
+            None,
+            None,
+            false,
+        );
+        let backend = ProviderBackend {
+            definition,
+            entry: ProviderEntry {
+                headers: Some(HashMap::from([(
+                    "x-plugin-secret".to_string(),
+                    "must-not-be-sent".to_string(),
+                )])),
+                ..Default::default()
+            },
+            include_entry_headers: false,
+        };
+
+        let resolved = backend
+            .resolve_inference_with(Some("test-key"), no_env, || Ok(None), None)
+            .unwrap();
+        assert!(resolved.headers.get("x-plugin-secret").is_none());
     }
 
     #[test]
@@ -760,7 +815,21 @@ mod tests {
             ),
         ];
         for (alias, inference, discovery) in cases {
-            let backend = ProviderBackend::new(alias, &HashMap::new(), None).unwrap();
+            // Explicit API-key auth makes the Anthropic row independent of a
+            // developer's real stored OAuth credential and prevents refresh
+            // or network behavior inside this dispatch-only unit test.
+            let providers = if alias == "anthropic" {
+                HashMap::from([(
+                    alias.to_string(),
+                    ProviderEntry {
+                        auth: Some(ProviderAuth::ApiKey),
+                        ..Default::default()
+                    },
+                )])
+            } else {
+                HashMap::new()
+            };
+            let backend = ProviderBackend::new(alias, &providers, None).unwrap();
             let resolved = backend
                 .resolve_inference_with(
                     None,

@@ -20,9 +20,9 @@ pub mod summarize;
 pub mod wire;
 
 pub use self::spawn::Prompt;
-pub use backend::*;
+pub use backend::ProviderBackend;
 pub use build::*;
-pub use discovery::*;
+pub use discovery::DiscoveredModel;
 pub use dispatch::*;
 pub use resolve::*;
 pub use route::*;

@@ -241,6 +241,12 @@ async fn fetch_provider_catalog(
     if !force_refresh && let Some(entries) = cached(alias, true) {
         return Ok(entries);
     }
+    // Preserve the catalog's historical short notice for aliases that cannot
+    // be resolved (including invalid provider definitions). Inference keeps
+    // ProviderBackend's more actionable supported-provider message.
+    if super::resolve_provider_info(alias, providers).is_none() {
+        anyhow::bail!("unknown provider: {alias}")
+    }
     let discovery = ProviderBackend::new(alias, providers, default_auth)?.model_discovery()?;
     let entries: Vec<ModelCatalogEntry> = discovery
         .list_models()
@@ -291,6 +297,18 @@ mod tests {
         assert_eq!(row.id, "model-a");
         assert_eq!(row.source, CatalogSource::Remote);
         assert_eq!(row.context_window, Some(200_000));
+    }
+
+    #[tokio::test]
+    async fn unknown_provider_error_text_remains_stable() {
+        let error =
+            fetch_provider_catalog("definitely-unknown-provider", &HashMap::new(), None, true)
+                .await
+                .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "unknown provider: definitely-unknown-provider"
+        );
     }
 
     #[test]
