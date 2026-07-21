@@ -98,6 +98,7 @@ fn create_role_client(
 #[allow(clippy::too_many_arguments)]
 pub async fn build_agent(
     model: AnyModel,
+    active_provider: &str,
     cli: &Cli,
     cfg: &Config,
     context: &ContextFiles,
@@ -117,10 +118,11 @@ pub async fn build_agent(
     let parent_model = model.clone();
     // Resolve the per-provider chunk timeout once here so every
     // spawn_runner / run_print call on the resulting agent uses the
-    // same value. Provider name comes from the resolved CLI / config
-    // (already factored into resolve_provider above the call site).
-    let provider_name = cli.resolve_provider(cfg);
-    let chunk_timeout = cfg.resolve_stream_chunk_timeout(&provider_name);
+    // same value. The provider alias is runtime state: `/model`, session
+    // switching, and the model picker can all move away from the launch-time
+    // CLI/config provider. Callers therefore pass the live alias explicitly.
+    let provider_name = active_provider;
+    let chunk_timeout = cfg.resolve_stream_chunk_timeout(provider_name);
     // Capture the model identifier before `match model` consumes
     // it — forwarded into `AnyAgent.model_name` so `spawn_runner`
     // can plumb it through to the `tool_input_repair` telemetry.
@@ -131,7 +133,7 @@ pub async fn build_agent(
     // route) this is its model; otherwise the main model. Only the
     // `TaskTool` in `build_loop_tools` consumes `parent_model`, so routing
     // here is sufficient. A `task(agent=…)` profile model still overrides.
-    let subagent_model = resolve_subagent_model(cfg);
+    let subagent_model = resolve_subagent_model(cfg, active_provider);
     let loop_task_model = subagent_model.unwrap_or_else(|| parent_model.clone());
 
     macro_rules! build_inner {
@@ -161,8 +163,7 @@ pub async fn build_agent(
             // explicitly so model-family steering tracks /model and /agent
             // swaps instead of the launch-time CLI model (dirge-5db6).
             let (agent, cache, memory_provider) =
-                builder::build_agent_inner($m, cli, cfg, context, &provider_name, &model_name)
-                    .await;
+                builder::build_agent_inner($m, cli, cfg, context, provider_name, &model_name).await;
 
             // Phase 4.5h-6: also build the LoopTool registry the
             // new agent_loop path dispatches against. Tools share
@@ -260,7 +261,7 @@ pub async fn build_agent(
 
     if matches!(parent_model, AnyModel::OpenAICodex(_)) {
         match client::create_openai_api_key_fallback_client(
-            &provider_name,
+            provider_name,
             openai_api_billing_fallback_key(cli),
             &cfg.providers_map(),
         ) {
@@ -294,14 +295,14 @@ pub async fn build_agent(
     // model. Either way adapts `summarize_with_model` (AnyModel + prompt →
     // summary) to the `SummarizeFn` shape.
     {
-        let summarize_fn = build_summarize_fn(cfg, parent_model.clone());
+        let summarize_fn = build_summarize_fn(cfg, active_provider, parent_model.clone());
         agent = agent.with_summarizer(summarize_fn);
     }
 
     // Phase 4 part 1 — dual-client escalation wiring.
     //
     // When the user has configured `escalation_provider` AND it
-    // resolves to a DIFFERENT (alias, entry) than `ConfigRole::Default`,
+    // resolves to a DIFFERENT alias than the live runtime route,
     // build a second StreamFn that the loop will swap to for ONE call
     // after a repair-exhaustion or tree-sitter syntactic failure.
     //
@@ -318,7 +319,7 @@ pub async fn build_agent(
     // silently disabling — the user asked for a feature and we
     // owe them a clear failure mode.
     if cfg.escalation_provider.is_some() {
-        let default_role = cfg.resolve_role(crate::config::ConfigRole::Default);
+        let default_role = Some((active_provider.to_string(), ProviderEntry::default()));
         let escalation_role = cfg.resolve_role(crate::config::ConfigRole::Escalation);
         match (default_role, escalation_role) {
             (Some((default_alias, _)), Some((escalation_alias, escalation_entry))) => {
@@ -533,7 +534,7 @@ pub async fn build_agent(
     // dirge-z73i — background-review route wiring.
     //
     // When the user has configured `review_provider` AND it
-    // resolves to a different (alias, entry) than `ConfigRole::Default`,
+    // resolves to a different alias than the live runtime route,
     // build a review-specific stream_fn so `spawn_review_runner` runs
     // through the configured cheaper / smarter model.
     //
@@ -542,7 +543,7 @@ pub async fn build_agent(
     // fallback inside `spawn_review_runner_with_cache` produces an
     // identical request).
     if cfg.review_provider.is_some() {
-        let default_role = cfg.resolve_role(crate::config::ConfigRole::Default);
+        let default_role = Some((active_provider.to_string(), ProviderEntry::default()));
         let review_role = cfg.resolve_role(crate::config::ConfigRole::Review);
         match (default_role, review_role) {
             (Some((default_alias, _)), Some((review_alias, review_entry))) => {
@@ -713,9 +714,11 @@ pub(crate) fn build_compaction_model(
     cfg: &Config,
     main_client: &AnyClient,
     main_model_name: &str,
+    active_provider: &str,
 ) -> anyhow::Result<AnyModel> {
     resolve_summarization_model(
         cfg,
+        active_provider,
         main_client.completion_model(main_model_name.to_string()),
     )
 }
@@ -735,13 +738,13 @@ pub(crate) fn build_compaction_model(
 /// `ANTHROPIC_OAUTH_COMPACTION_DISABLED`, which both callers adapt.
 pub(crate) fn resolve_summarization_model(
     cfg: &Config,
+    active_provider: &str,
     fallback: AnyModel,
 ) -> anyhow::Result<AnyModel> {
     if cfg.summarization_provider.is_some() {
-        let default_role = cfg.resolve_role(crate::config::ConfigRole::Default);
         let summ_role = cfg.resolve_role(crate::config::ConfigRole::Summarization);
-        if let (Some((default_alias, _)), Some((alias, entry))) = (default_role, summ_role)
-            && !default_alias.eq_ignore_ascii_case(&alias)
+        if let Some((alias, entry)) = summ_role
+            && !active_provider.eq_ignore_ascii_case(&alias)
         {
             match create_role_client(&alias, &cfg.providers_map(), cfg.auth) {
                 Ok(client) => {
@@ -784,6 +787,7 @@ fn anthropic_oauth_compaction_disabled_fn() -> crate::agent::compression::Summar
 /// `SummarizeFn` callback consumed by the agent loop.
 pub(crate) fn build_summarize_fn(
     cfg: &Config,
+    active_provider: &str,
     main_model: AnyModel,
 ) -> crate::agent::compression::SummarizeFn {
     let from_model = |model: AnyModel| -> crate::agent::compression::SummarizeFn {
@@ -797,7 +801,7 @@ pub(crate) fn build_summarize_fn(
     // resolver; the OAuth-disabled error is adapted into the disabled-fn shape
     // the loop expects (an Err-returning SummarizeFn), instead of a
     // separately-maintained copy of the routing that had drifted.
-    match resolve_summarization_model(cfg, main_model) {
+    match resolve_summarization_model(cfg, active_provider, main_model) {
         Ok(model) => from_model(model),
         Err(_) => anthropic_oauth_compaction_disabled_fn(),
     }
@@ -809,11 +813,10 @@ pub(crate) fn build_summarize_fn(
 /// route; otherwise `None` (the caller keeps the main model). A profile
 /// route on a specific `task(agent=…)` call still overrides this — it is
 /// the fallback default, matching `task.rs`'s `route_model.unwrap_or`.
-fn resolve_subagent_model(cfg: &Config) -> Option<AnyModel> {
+fn resolve_subagent_model(cfg: &Config, active_provider: &str) -> Option<AnyModel> {
     cfg.subagent_provider.as_ref()?;
-    let (default_alias, _) = cfg.resolve_role(crate::config::ConfigRole::Default)?;
     let (alias, entry) = cfg.resolve_role(crate::config::ConfigRole::Subagent)?;
-    if default_alias.eq_ignore_ascii_case(&alias) {
+    if active_provider.eq_ignore_ascii_case(&alias) {
         return None;
     }
     match create_role_client(&alias, &cfg.providers_map(), cfg.auth) {
@@ -981,7 +984,7 @@ mod nw25_tests {
         let cfg = Config::default();
         assert!(cfg.subagent_provider.is_none());
         assert!(
-            resolve_subagent_model(&cfg).is_none(),
+            resolve_subagent_model(&cfg, "openai").is_none(),
             "unset subagent_provider must yield no override model"
         );
     }

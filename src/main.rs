@@ -1493,6 +1493,7 @@ async fn main() -> anyhow::Result<()> {
         let session_id_for_print = session_id_for_agent(&cli, &session);
         let agent = provider::build_agent(
             completion_model,
+            session.provider.as_str(),
             &cli,
             &cfg,
             &context,
@@ -1618,6 +1619,7 @@ async fn main() -> anyhow::Result<()> {
                 let m = client.completion_model(model.to_string());
                 provider::build_agent(
                     m,
+                    session.provider.as_str(),
                     &cli,
                     &cfg,
                     &context,
@@ -1672,6 +1674,7 @@ async fn main() -> anyhow::Result<()> {
                         let m = client.completion_model(new_model);
                         current_agent = provider::build_agent(
                             m,
+                            session.provider.as_str(),
                             &cli,
                             &cfg,
                             &context,
@@ -1743,6 +1746,7 @@ async fn main() -> anyhow::Result<()> {
 
         let agent = provider::build_agent(
             completion_model,
+            session.provider.as_str(),
             &cli,
             &cfg,
             &context,

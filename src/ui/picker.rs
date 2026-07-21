@@ -27,6 +27,140 @@ pub struct ListPicker {
     prompt: String,
 }
 
+#[derive(Clone)]
+pub struct SearchItem<T> {
+    pub value: T,
+    pub label: String,
+    pub search_text: String,
+}
+
+pub enum SearchPickerAction<T> {
+    None,
+    Cancelled,
+    Selected(T),
+}
+
+/// Typed fuzzy-search picker used by route catalogs and future searchable
+/// command surfaces. The renderer only receives owned display rows; callers
+/// recover the typed selected value on Enter.
+pub struct SearchPicker<T> {
+    pub active: bool,
+    pub query: String,
+    items: Vec<SearchItem<T>>,
+    matches: Vec<usize>,
+    pub selected: usize,
+    prompt: String,
+}
+
+impl<T: Clone> SearchPicker<T> {
+    pub fn new(prompt: impl Into<String>, items: Vec<SearchItem<T>>, query: String) -> Self {
+        let mut picker = Self {
+            active: true,
+            query,
+            items,
+            matches: Vec::new(),
+            selected: 0,
+            prompt: prompt.into(),
+        };
+        picker.filter();
+        picker
+    }
+
+    pub fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> SearchPickerAction<T> {
+        use crossterm::event::KeyCode;
+        match key.code {
+            KeyCode::Up => {
+                self.selected = self.selected.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                if self.selected + 1 < self.matches.len() {
+                    self.selected += 1;
+                }
+            }
+            KeyCode::Backspace => {
+                self.query.pop();
+                self.filter();
+            }
+            KeyCode::Char(c)
+                if !c.is_control()
+                    && (key.modifiers.is_empty()
+                        || key.modifiers == crossterm::event::KeyModifiers::SHIFT) =>
+            {
+                self.query.push(c);
+                self.filter();
+            }
+            KeyCode::Enter => {
+                if let Some(index) = self.matches.get(self.selected) {
+                    self.active = false;
+                    return SearchPickerAction::Selected(self.items[*index].value.clone());
+                }
+            }
+            KeyCode::Esc => {
+                self.active = false;
+                return SearchPickerAction::Cancelled;
+            }
+            _ => {}
+        }
+        SearchPickerAction::None
+    }
+
+    pub fn append_query(&mut self, text: &str) {
+        self.query.extend(text.chars().filter(|c| !c.is_control()));
+        self.filter();
+    }
+
+    pub fn overlay(&self) -> PickerOverlay {
+        PickerOverlay {
+            title: Some(if self.query.is_empty() {
+                self.prompt.clone()
+            } else {
+                format!("{} {}", self.prompt, self.query)
+            }),
+            rows: self
+                .matches
+                .iter()
+                .take(100)
+                .map(|index| self.items[*index].label.clone())
+                .collect(),
+            selected: self.selected,
+            empty_hint: Some("no matching models".to_string()),
+        }
+    }
+
+    fn filter(&mut self) {
+        use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
+        use nucleo_matcher::{Config, Matcher, Utf32Str};
+
+        self.selected = 0;
+        if self.query.trim().is_empty() {
+            self.matches = (0..self.items.len().min(100)).collect();
+            return;
+        }
+        let atom = Atom::new(
+            &self.query,
+            CaseMatching::Smart,
+            Normalization::Smart,
+            AtomKind::Fuzzy,
+            false,
+        );
+        let mut matcher = Matcher::new(Config::DEFAULT);
+        let mut buf = Vec::new();
+        let mut indices = Vec::new();
+        let mut scored = Vec::new();
+        for (index, item) in self.items.iter().enumerate() {
+            buf.clear();
+            indices.clear();
+            let haystack = Utf32Str::new(&item.search_text, &mut buf);
+            if let Some(score) = atom.indices(haystack, &mut matcher, &mut indices) {
+                scored.push((index, score));
+            }
+        }
+        scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        scored.truncate(100);
+        self.matches = scored.into_iter().map(|(index, _)| index).collect();
+    }
+}
+
 impl ListPicker {
     pub fn new() -> Self {
         ListPicker {
@@ -253,4 +387,64 @@ fn walk_files(root: &str) -> Vec<PathBuf> {
         }
     }
     files
+}
+
+#[cfg(test)]
+mod search_picker_tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn picker(query: &str) -> SearchPicker<&'static str> {
+        SearchPicker::new(
+            "Models:",
+            vec![
+                SearchItem {
+                    value: "claude",
+                    label: "anthropic claude-sonnet".into(),
+                    search_text: "anthropic claude-sonnet Claude Sonnet".into(),
+                },
+                SearchItem {
+                    value: "gpt",
+                    label: "openai gpt-5".into(),
+                    search_text: "openai gpt-5".into(),
+                },
+            ],
+            query.into(),
+        )
+    }
+
+    #[test]
+    fn fuzzy_query_filters_and_enter_returns_typed_value() {
+        let mut picker = picker("cld snnt");
+        assert_eq!(picker.overlay().rows, ["anthropic claude-sonnet"]);
+        assert!(matches!(
+            picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            SearchPickerAction::Selected("claude")
+        ));
+    }
+
+    #[test]
+    fn editing_navigation_and_cancel_are_safe() {
+        let mut picker = picker("");
+        let _ = picker.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(picker.selected, 1);
+        let _ = picker.handle_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT));
+        assert_eq!(picker.query, "G");
+        let _ = picker.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert!(picker.query.is_empty());
+        assert!(matches!(
+            picker.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            SearchPickerAction::Cancelled
+        ));
+    }
+
+    #[test]
+    fn empty_results_enter_does_not_panic() {
+        let mut picker = picker("zzzz-no-model");
+        assert!(picker.overlay().rows.is_empty());
+        assert!(matches!(
+            picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            SearchPickerAction::None
+        ));
+    }
 }

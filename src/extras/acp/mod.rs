@@ -357,6 +357,7 @@ async fn run_prompt(
     let bg_store = crate::agent::tools::background::BackgroundStore::new();
     let agent = crate::provider::build_agent(
         model,
+        &provider_str,
         &state.cli,
         &state.cfg,
         &state.context,

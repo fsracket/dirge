@@ -5,7 +5,6 @@ pub(crate) mod list;
 pub(crate) mod switch;
 
 use crate::session::Session;
-use crate::ui::slash::cmd::agent;
 use crate::ui::slash::{SlashCtx, c_agent, c_result};
 
 /// Parsed `/sessions` request. Split from the handler so the verb routing
@@ -163,15 +162,25 @@ fn usage(ctx: &mut SlashCtx<'_>, what: &str) -> anyhow::Result<()> {
 /// disk) and the delete-current path (a fresh session), so booting between
 /// sessions is identical no matter the trigger.
 pub(crate) async fn swap_to_session(ctx: &mut SlashCtx<'_>, next: Session) -> anyhow::Result<()> {
+    // Authenticate the saved route before tearing down the current session.
+    // A missing credential or removed provider must leave the live route and
+    // conversation untouched.
+    let providers = ctx.cfg.providers_map();
+    let prepared = crate::provider::prepare_active_route(
+        next.provider.as_str(),
+        next.model.as_str(),
+        next.model_explicit,
+        &providers,
+        ctx.cfg.auth,
+    )?;
+
     if let Some(store) = ctx.bg_store.as_ref() {
         store.cancel_all();
     }
     crate::agent::review::maybe_fire_session_end(ctx.agent, ctx.session);
     let old_id = ctx.session.id.to_string();
-    *ctx.session = next;
-    crate::agent::review::maybe_fire_session_switch(ctx.agent, &ctx.session.id, &old_id, false);
 
-    let restored = ctx.session.current_prompt_name.clone();
+    let restored = next.current_prompt_name.clone();
     if let Some(name) = restored.as_deref()
         && let Some(p) = ctx.context.prompts.get(name).cloned()
     {
@@ -186,11 +195,42 @@ pub(crate) async fn swap_to_session(ctx: &mut SlashCtx<'_>, next: Session) -> an
         );
     }
 
+    let model = prepared
+        .client
+        .completion_model(prepared.route.model_id.clone());
+    let replacement_agent = crate::provider::build_agent(
+        model,
+        &prepared.route.provider_alias,
+        ctx.cli,
+        ctx.cfg,
+        ctx.context,
+        ctx.permission.clone(),
+        ctx.ask_tx.clone(),
+        ctx.question_tx.clone(),
+        ctx.plan_tx.clone(),
+        ctx.bg_store.clone(),
+        #[cfg(feature = "lsp")]
+        ctx.lsp_manager.cloned(),
+        ctx.sandbox.clone(),
+        #[cfg(feature = "mcp")]
+        ctx.mcp_manager,
+        #[cfg(feature = "semantic")]
+        ctx.semantic_manager,
+        Some(next.id.to_string()),
+    )
+    .await;
+
+    *ctx.client = prepared.client;
+    *ctx.agent = replacement_agent;
+    *ctx.session = next;
+    ctx.session.provider = compact_str::CompactString::new(&prepared.route.provider_alias);
+    ctx.session.model = compact_str::CompactString::new(&prepared.route.model_id);
+    ctx.session.model_explicit = prepared.route.model_explicit;
+    crate::agent::review::maybe_fire_session_switch(ctx.agent, &ctx.session.id, &old_id, false);
+
     // Rebuild the TODOS / MODIFIED panels from the switched-to session's
     // history; these globals don't carry across a swap.
     crate::session::rehydrate::restore_panels(ctx.session);
-
-    agent::rebuild_agent(ctx).await;
     Ok(())
 }
 

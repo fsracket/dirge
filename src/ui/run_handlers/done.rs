@@ -19,8 +19,6 @@ use compact_str::CompactString;
 use crossterm::style::Color;
 use tokio::sync::mpsc;
 
-#[cfg(feature = "plugin")]
-use crate::context::ContextFiles;
 use crate::event::AgentEvent;
 #[cfg(feature = "plugin")]
 use crate::plugin::PluginManager;
@@ -42,17 +40,15 @@ pub(crate) struct LoopBits<'a> {
     pub label: &'a mut Option<String>,
 }
 
-/// Outcome of [`prepare_next_model_client`]: tells the caller whether to go on
+/// Outcome of [`prepare_next_model_route`]: tells the caller whether to go on
 /// and rebuild the agent, and if so whether the provider changed.
 #[cfg(feature = "plugin")]
 pub(crate) enum NextModelAction {
     /// Don't apply the swap — empty/unchanged model, an unroutable family, or a
     /// client that failed to build. Any warning has already been rendered.
     Skip,
-    /// Rebuild the agent for the new model. `swapped_provider` is `Some(alias)`
-    /// when the live client was swapped to a different provider (so the caller
-    /// updates `session.provider`); `None` for a same-client rename.
-    Apply { swapped_provider: Option<String> },
+    /// Install the model through the shared atomic route seam.
+    Apply { provider_alias: String },
 }
 
 /// dirge-m6ut: resolve the plugin `prepare-next-run` model against the
@@ -67,8 +63,7 @@ pub(crate) enum NextModelAction {
 /// can't happen (family with no configured provider, or a client that fails to
 /// build), so an unroutable request is explained rather than mis-sent.
 #[cfg(feature = "plugin")]
-pub(crate) fn prepare_next_model_client(
-    client: &mut crate::provider::AnyClient,
+pub(crate) fn prepare_next_model_route(
     renderer: &mut crate::ui::renderer::Renderer,
     session: &crate::session::Session,
     cfg: &crate::config::Config,
@@ -84,30 +79,11 @@ pub(crate) fn prepare_next_model_client(
     match crate::provider::resolve_model_switch(&providers, session.provider.as_str(), trimmed) {
         // Same provider (or unclassifiable id) → rename on the current client.
         crate::provider::ModelSwitch::Keep => Ok(NextModelAction::Apply {
-            swapped_provider: None,
+            provider_alias: session.provider.to_string(),
         }),
-        // A different provider → build its client and install it in place so the
-        // rebuilt agent (and every later turn) runs there.
-        crate::provider::ModelSwitch::Switch(alias) => {
-            match crate::provider::create_client_with_auth(&alias, None, &providers, cfg.auth) {
-                Ok(new_client) => {
-                    *client = new_client;
-                    Ok(NextModelAction::Apply {
-                        swapped_provider: Some(alias),
-                    })
-                }
-                Err(e) => {
-                    renderer.write_line(
-                        &format!(
-                            "[plugin] can't swap to '{trimmed}': failed to build provider '{alias}' ({e}) — staying on '{}'.",
-                            session.provider,
-                        ),
-                        c_error(),
-                    )?;
-                    Ok(NextModelAction::Skip)
-                }
-            }
-        }
+        crate::provider::ModelSwitch::Switch(alias) => Ok(NextModelAction::Apply {
+            provider_alias: alias,
+        }),
         crate::provider::ModelSwitch::NoProviderForFamily(family) => {
             renderer.write_line(
                 &format!(
@@ -119,79 +95,6 @@ pub(crate) fn prepare_next_model_client(
             Ok(NextModelAction::Skip)
         }
     }
-}
-
-/// Apply a `prepare-next-run` model swap on-loop (dirge-qhfk stage 3b).
-/// Rebuilds the agent for the new model so the next user prompt runs against it,
-/// updating the session's model/provider/context-window. Extracted from
-/// handle_done so the off-loop `done_phase` arm can run it after the hook chain
-/// resolves.
-///
-/// The routing decision and any client swap happen upstream in
-/// [`prepare_next_model_client`]; by the time we're here `deps.client` is
-/// already the right client, so this just rebuilds the agent from it.
-/// `swapped_provider` carries the target alias when the client was swapped to a
-/// different provider (`None` for a same-client rename).
-#[cfg(feature = "plugin")]
-pub(crate) async fn apply_next_model(
-    ctx: &mut RunCtx<'_>,
-    agent: &mut AnyAgent,
-    context: &mut ContextFiles,
-    deps: &AgentBuildDeps<'_>,
-    next_model: &str,
-    swapped_provider: Option<String>,
-) -> anyhow::Result<()> {
-    let trimmed = next_model.trim();
-    // Defensive: `prepare_next_model_client` already guaranteed a non-empty,
-    // changed model, but keep the guard so a direct caller can't rename to junk.
-    if trimmed.is_empty() || trimmed == ctx.session.model.as_str() {
-        return Ok(());
-    }
-    let new_model_compact = CompactString::new(trimmed);
-    let model_obj = deps.client.completion_model(new_model_compact.to_string());
-    *agent = crate::provider::build_agent(
-        model_obj,
-        ctx.cli,
-        ctx.cfg,
-        context,
-        deps.permission.clone(),
-        deps.ask_tx.clone(),
-        deps.question_tx.clone(),
-        deps.plan_tx.clone(),
-        deps.bg_store.clone(),
-        #[cfg(feature = "lsp")]
-        deps.lsp_manager.cloned(),
-        deps.sandbox.clone(),
-        #[cfg(feature = "mcp")]
-        deps.mcp_manager,
-        #[cfg(feature = "semantic")]
-        deps.semantic_manager,
-        Some(ctx.session.id.to_string()),
-    )
-    .await;
-    let old_model = ctx.session.model.clone();
-    ctx.session.model = new_model_compact.clone();
-    // Only touch `session.provider` when the client actually moved (dirge-cfaw /
-    // dirge-m6ut). A same-client rename leaves it unchanged; re-resolving from
-    // CLI/config used to clobber a session that had switched providers.
-    if let Some(alias) = &swapped_provider {
-        ctx.session.provider = CompactString::new(alias);
-    }
-    // Re-resolve context window for the new model — mirrors `/model` so a
-    // 128k→1M jump (or vice versa) updates the status indicator.
-    let new_ctx = ctx.cfg.resolve_context_window(new_model_compact.as_str());
-    if new_ctx != ctx.session.context_window {
-        ctx.session.context_window = new_ctx;
-    }
-    let provider_note = swapped_provider
-        .as_deref()
-        .map(|a| format!("  ·  {a}"))
-        .unwrap_or_default();
-    ctx.renderer.write_line(
-        &format!("[plugin] swapped model: {old_model} → {new_model_compact}{provider_note}"),
-        c_agent(),
-    )?;
-    Ok(())
 }
 
 // dirge-qhfk stage 3b: handle_done no longer holds the plugin-manager lock
@@ -732,8 +635,7 @@ pub(crate) fn finalize_idle_turn(
 }
 
 // dirge-m6ut: the plugin prepare-next-run swap now hops providers. These
-// exercise the client-swapping half (`prepare_next_model_client`) directly —
-// the pure routing decision is covered by `resolve_model_switch` tests. Gated
+// exercise the plugin adapter that feeds the shared atomic route seam. Gated
 // on `plugin` because that's what compiles the function.
 #[cfg(all(test, feature = "plugin"))]
 mod next_model_tests {
@@ -780,9 +682,9 @@ mod next_model_tests {
     }
 
     #[test]
-    fn free_form_glm_id_swaps_the_live_client_to_glm() {
+    fn free_form_glm_id_prepares_glm_route_without_mutating_client() {
         let cfg = cfg_with_glm();
-        let mut client = deepseek_client(&cfg);
+        let client = deepseek_client(&cfg);
         assert_eq!(provider_of(&client), "deepseek");
         let mut renderer = crate::ui::renderer::Renderer::new().expect("renderer");
         let session = Session::new("deepseek", "deepseek-v4-pro", 128_000);
@@ -790,38 +692,35 @@ mod next_model_tests {
         // `glm-4.6` isn't pinned anywhere, but its family maps to the configured
         // glm provider — the client must actually hop there (dirge-m6ut).
         let action =
-            prepare_next_model_client(&mut client, &mut renderer, &session, &cfg, "glm-4.6")
-                .expect("prepare");
+            prepare_next_model_route(&mut renderer, &session, &cfg, "glm-4.6").expect("prepare");
         match action {
-            NextModelAction::Apply { swapped_provider } => {
-                assert_eq!(swapped_provider.as_deref(), Some("glm"))
+            NextModelAction::Apply { provider_alias } => {
+                assert_eq!(provider_alias, "glm")
             }
             NextModelAction::Skip => panic!("expected a provider swap, got Skip"),
         }
-        assert_eq!(provider_of(&client), "glm", "live client must now be glm");
+        assert_eq!(
+            provider_of(&client),
+            "deepseek",
+            "preparation must not mutate the live client before atomic install"
+        );
     }
 
     #[test]
     fn same_provider_rename_keeps_the_client() {
         let cfg = cfg_with_glm();
-        let mut client = deepseek_client(&cfg);
+        let client = deepseek_client(&cfg);
         let mut renderer = crate::ui::renderer::Renderer::new().expect("renderer");
         let session = Session::new("deepseek", "deepseek-v4-pro", 128_000);
 
-        let action = prepare_next_model_client(
-            &mut client,
-            &mut renderer,
-            &session,
-            &cfg,
-            "deepseek-v4-flash",
-        )
-        .expect("prepare");
+        let action = prepare_next_model_route(&mut renderer, &session, &cfg, "deepseek-v4-flash")
+            .expect("prepare");
         assert!(
             matches!(
                 action,
                 NextModelAction::Apply {
-                    swapped_provider: None
-                }
+                    provider_alias
+                } if provider_alias == "deepseek"
             ),
             "same-provider rename must not swap the client"
         );
@@ -831,13 +730,12 @@ mod next_model_tests {
     #[test]
     fn unconfigured_family_is_skipped_and_client_untouched() {
         let cfg = cfg_with_glm(); // no anthropic provider
-        let mut client = deepseek_client(&cfg);
+        let client = deepseek_client(&cfg);
         let mut renderer = crate::ui::renderer::Renderer::new().expect("renderer");
         let session = Session::new("deepseek", "deepseek-v4-pro", 128_000);
 
-        let action =
-            prepare_next_model_client(&mut client, &mut renderer, &session, &cfg, "claude-opus-4")
-                .expect("prepare");
+        let action = prepare_next_model_route(&mut renderer, &session, &cfg, "claude-opus-4")
+            .expect("prepare");
         assert!(matches!(action, NextModelAction::Skip));
         assert_eq!(
             provider_of(&client),
@@ -849,13 +747,13 @@ mod next_model_tests {
     #[test]
     fn empty_or_unchanged_model_is_skipped() {
         let cfg = cfg_with_glm();
-        let mut client = deepseek_client(&cfg);
+        let client = deepseek_client(&cfg);
         let mut renderer = crate::ui::renderer::Renderer::new().expect("renderer");
         let session = Session::new("deepseek", "deepseek-v4-pro", 128_000);
 
         for id in ["", "   ", "deepseek-v4-pro"] {
-            let action = prepare_next_model_client(&mut client, &mut renderer, &session, &cfg, id)
-                .expect("prepare");
+            let action =
+                prepare_next_model_route(&mut renderer, &session, &cfg, id).expect("prepare");
             assert!(matches!(action, NextModelAction::Skip), "id {id:?}");
         }
         assert_eq!(provider_of(&client), "deepseek");

@@ -196,6 +196,7 @@ pub(crate) async fn handle_context_compacted(
     let model = client.completion_model(ctx.session.model.to_string());
     *agent = crate::provider::build_agent(
         model,
+        ctx.session.provider.as_str(),
         ctx.cli,
         ctx.cfg,
         context,

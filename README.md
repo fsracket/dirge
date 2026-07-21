@@ -288,7 +288,7 @@ authorization, delete the `auth.json` file and log in again.
 | Command | Description |
 |---------|-------------|
 | `/edit` | Open the input buffer in `$EDITOR` (same as `Ctrl+G`) |
-| `/model [name]` | Show or switch model |
+| `/model` | Open a fuzzy-searchable catalog across configured providers. Use `/model search <query>` to start filtered, `/model refresh` to bypass the 15-minute in-memory cache, or `/model <exact-id>` for a direct switch. |
 | `/prompt [name]` | List or activate prompts (`code`, `plan`, `review`, etc.) |
 | `/agent [name\|off]` | List or switch [agent profiles](docs/agents.md) — a named model + prompt + tool-policy bundle |
 | `/clear` | Clear conversation |

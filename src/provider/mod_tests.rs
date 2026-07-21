@@ -845,7 +845,7 @@ fn ui_compaction_model_honors_summarization_provider() {
         crate::provider::create_client_with_auth("main", None, &cfg.providers_map(), cfg.auth)
             .expect("main client builds from literal API key");
 
-    let model = crate::provider::build_compaction_model(&cfg, &main_client, "gpt-main")
+    let model = crate::provider::build_compaction_model(&cfg, &main_client, "gpt-main", "openai")
         .expect("summarization_provider route resolves");
 
     assert!(
@@ -873,7 +873,7 @@ async fn in_loop_compaction_refuses_anthropic_oauth_without_summarization_provid
         .expect("Anthropic OAuth client builds");
     let model = crate::provider::AnyModel::AnthropicOauth(client.completion_model("claude-sonnet"));
 
-    let summarize = crate::provider::build_summarize_fn(&cfg, model);
+    let summarize = crate::provider::build_summarize_fn(&cfg, "openai", model);
     let err = summarize("prompt".to_string())
         .await
         .expect_err("Anthropic OAuth must not be used for in-loop side compaction");
@@ -904,7 +904,12 @@ fn ui_compaction_refuses_anthropic_oauth_without_summarization_provider() {
             .expect("Anthropic OAuth client builds"),
     );
 
-    let err = match crate::provider::build_compaction_model(&cfg, &main_client, "claude-sonnet") {
+    let err = match crate::provider::build_compaction_model(
+        &cfg,
+        &main_client,
+        "claude-sonnet",
+        "anthropic",
+    ) {
         Ok(_) => panic!("Anthropic OAuth must not be used for side compaction"),
         Err(err) => err,
     };
@@ -1483,6 +1488,7 @@ async fn cerebras_identity_survives_client_model_and_agent_construction() {
     };
     let agent = build_agent(
         model,
+        "cerebras",
         &cli,
         &cfg,
         &context,

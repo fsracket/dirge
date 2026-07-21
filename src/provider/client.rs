@@ -99,6 +99,161 @@ pub(crate) fn create_client_with_auth(
     )
 }
 
+/// Secret-bearing HTTP transport used only by provider catalog discovery.
+/// Deliberately has no `Debug` implementation so authentication headers can
+/// never be formatted into a UI error or trace record.
+pub(crate) struct CatalogTransport {
+    pub(crate) kind: ProviderKind,
+    pub(crate) base_url: String,
+    pub(crate) http: reqwest::Client,
+}
+
+/// Resolve catalog authentication through the same credential, base-URL,
+/// custom-header, OAuth-refresh, and insecure-URL primitives as completion
+/// client construction. Provider-specific response parsing lives in
+/// `provider::catalog`; the UI never sees credentials.
+pub(crate) fn create_catalog_transport_with_auth(
+    provider_name: &str,
+    providers: &HashMap<String, ProviderEntry>,
+    default_auth: Option<ProviderAuth>,
+) -> anyhow::Result<CatalogTransport> {
+    let info = resolve_provider_info(provider_name, providers)
+        .ok_or_else(|| anyhow::anyhow!("unknown provider: {provider_name}"))?;
+    let mut headers = providers
+        .get(provider_name)
+        .or_else(|| providers.get(&provider_name.to_ascii_lowercase()))
+        .map(ProviderEntry::resolved_headers)
+        .transpose()?
+        .unwrap_or_default();
+    let env = |name: &str| std::env::var(name).ok();
+    let anthropic_oauth_present = info.kind == ProviderKind::Anthropic
+        && (env("ANTHROPIC_OAUTH_TOKEN").is_some_and(|v| !v.trim().is_empty())
+            || super::anthropic_oauth::credentials_file_path().exists());
+    let auth = effective_auth(
+        info.auth.or(default_auth),
+        info.kind,
+        anthropic_oauth_present,
+    );
+    if auth == ProviderAuth::ChatGpt && info.kind != ProviderKind::OpenAI {
+        anyhow::bail!("ChatGPT auth is only supported for the openai provider")
+    }
+    if auth == ProviderAuth::Anthropic && info.kind != ProviderKind::Anthropic {
+        anyhow::bail!("Anthropic OAuth is only supported for the anthropic provider")
+    }
+    let auth_headers = resolve_auth_headers(auth)?;
+    let credential = if let Some(resolved) = auth_headers.as_ref() {
+        ProviderCredential::ChatGptAuth(resolved.bearer_token.clone())
+    } else {
+        let allow_openai_oauth =
+            provider_name.eq_ignore_ascii_case("openai") && info.base_url.is_none();
+        resolve_provider_credential(
+            allow_openai_oauth,
+            info.kind,
+            info.api_key_literal.as_deref(),
+            info.api_key_env.as_deref(),
+            None,
+            env,
+            load_fresh_openai_oauth,
+        )?
+    };
+    let uses_openai_oauth = credential.is_openai_oauth();
+    let secret = credential.into_secret();
+    let is_chatgpt_auth = auth == ProviderAuth::ChatGpt;
+    let base_url = match info.kind {
+        ProviderKind::OpenAI if uses_openai_oauth => CHATGPT_CODEX_BASE_URL.to_string(),
+        ProviderKind::OpenAI if is_chatgpt_auth => info
+            .base_url
+            .clone()
+            .unwrap_or_else(|| CHATGPT_CODEX_BASE_URL.to_string()),
+        _ => resolve_provider_base_url(info.kind, info.base_url.clone(), env)?
+            .unwrap_or_else(|| default_catalog_base_url(info.kind).to_string()),
+    };
+    if base_url.is_empty() {
+        anyhow::bail!("provider '{provider_name}' has no catalog base URL")
+    }
+    if matches!(auth, ProviderAuth::ChatGpt | ProviderAuth::Anthropic)
+        && !base_url.starts_with("https://")
+    {
+        anyhow::bail!("OAuth catalog discovery requires an https base URL")
+    }
+
+    let value = |s: &str| {
+        http::HeaderValue::from_str(s)
+            .map_err(|e| anyhow::anyhow!("invalid resolved authentication header: {e}"))
+    };
+    match info.kind {
+        ProviderKind::Anthropic => {
+            if auth == ProviderAuth::Anthropic {
+                headers.insert(
+                    http::HeaderName::from_static("authorization"),
+                    value(&format!("Bearer {secret}"))?,
+                );
+                headers.insert(
+                    http::HeaderName::from_static("anthropic-beta"),
+                    http::HeaderValue::from_static("oauth-2025-04-20"),
+                );
+            } else {
+                headers.insert(http::HeaderName::from_static("x-api-key"), value(&secret)?);
+            }
+            headers.insert(
+                http::HeaderName::from_static("anthropic-version"),
+                http::HeaderValue::from_static("2023-06-01"),
+            );
+        }
+        ProviderKind::Gemini => {
+            headers.insert(
+                http::HeaderName::from_static("x-goog-api-key"),
+                value(&secret)?,
+            );
+        }
+        ProviderKind::Ollama if secret.is_empty() => {}
+        _ => {
+            headers.insert(
+                http::HeaderName::from_static("authorization"),
+                value(&format!("Bearer {secret}"))?,
+            );
+        }
+    }
+    if let Some(account_id) = auth_headers
+        .as_ref()
+        .and_then(|resolved| resolved.chatgpt_account_id.as_deref())
+        .filter(|id| !id.trim().is_empty())
+    {
+        headers.insert(
+            http::HeaderName::from_static("chatgpt-account-id"),
+            value(account_id)?,
+        );
+    }
+    headers.insert(
+        http::HeaderName::from_static("accept"),
+        http::HeaderValue::from_static("application/json"),
+    );
+    let http = reqwest::Client::builder()
+        .default_headers(headers)
+        .timeout(std::time::Duration::from_secs(8))
+        .build()?;
+    Ok(CatalogTransport {
+        kind: info.kind,
+        base_url: base_url.trim_end_matches('/').to_string(),
+        http,
+    })
+}
+
+fn default_catalog_base_url(kind: ProviderKind) -> &'static str {
+    match kind {
+        ProviderKind::OpenRouter => "https://openrouter.ai/api/v1",
+        ProviderKind::OpenAI => "https://api.openai.com/v1",
+        ProviderKind::Anthropic => "https://api.anthropic.com",
+        ProviderKind::Gemini => "https://generativelanguage.googleapis.com",
+        ProviderKind::DeepSeek => "https://api.deepseek.com/v1",
+        ProviderKind::Glm => "https://open.bigmodel.cn/api/coding/paas/v4",
+        ProviderKind::Cerebras => "https://api.cerebras.ai/v1",
+        ProviderKind::OpenCode => "https://opencode.ai/zen/v1",
+        ProviderKind::Ollama => "http://localhost:11434",
+        ProviderKind::Custom => "",
+    }
+}
+
 pub(crate) fn create_openai_api_key_fallback_client(
     provider_name: &str,
     api_key: Option<&str>,

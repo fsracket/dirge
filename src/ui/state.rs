@@ -216,6 +216,8 @@ pub(crate) struct UiState {
     /// In-flight non-blocking `/btw` side query (one-shot LLM on a spawned task);
     /// the `btw_phase` arm renders the answer. dirge-nret.
     pub(crate) btw_phase: Option<crate::ui::btw::BtwPhaseHandle>,
+    /// In-flight provider catalog discovery started by `/model`.
+    pub(crate) model_catalog_phase: Option<crate::ui::model_catalog_phase::ModelCatalogPhaseHandle>,
     /// In-flight non-blocking `/wt-merge` (git merge on a blocking thread); the
     /// `wt_merge_phase` arm runs the post-merge continuation. dirge-iagk.
     /// Unconditional so the select! arm can be (select! rejects `#[cfg]` arms);
@@ -277,6 +279,11 @@ pub(crate) struct UiState {
 pub(crate) enum InputMode {
     /// Normal prompt editing.
     Compose,
+    /// Provider catalogs are loading off-loop. Esc/Ctrl+C cancels without
+    /// changing the current route.
+    ModelCatalogLoading,
+    /// Searchable provider/model route picker.
+    ModelPicker(ModelPickerState),
     /// `/plan` (or `plan_enter`/`plan_exit`) confirmation: y/n.
     PlanSwitch {
         reply: tokio::sync::oneshot::Sender<crate::agent::tools::plan::PlanSwitchResponse>,
@@ -302,6 +309,10 @@ pub(crate) enum InputMode {
     /// the keystroke, replies, and runs the chamber-reopen / cascade-deny
     /// / allowlist-save post-work.
     Permission(PermissionState),
+}
+
+pub(crate) struct ModelPickerState {
+    pub(crate) picker: crate::ui::picker::SearchPicker<crate::provider::catalog::ModelCatalogEntry>,
 }
 
 /// In-flight state for the tool-permission modal — replaces the former
@@ -374,6 +385,8 @@ impl CustomEntry {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ModalKind {
     Compose,
+    ModelCatalogLoading,
+    ModelPicker,
     PlanSwitch,
     Question,
     DialogConfirm,
@@ -391,6 +404,8 @@ impl InputMode {
     pub(crate) fn kind(&self) -> ModalKind {
         match self {
             InputMode::Compose => ModalKind::Compose,
+            InputMode::ModelCatalogLoading => ModalKind::ModelCatalogLoading,
+            InputMode::ModelPicker(_) => ModalKind::ModelPicker,
             InputMode::PlanSwitch { .. } => ModalKind::PlanSwitch,
             InputMode::Question(_) => ModalKind::Question,
             InputMode::DialogConfirm { .. } => ModalKind::DialogConfirm,
@@ -443,6 +458,7 @@ impl UiState {
             done_phase: None,
             review_phase: None,
             btw_phase: None,
+            model_catalog_phase: None,
             wt_merge_phase: None,
             shell_session: None,
             shell_parser: None,

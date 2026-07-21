@@ -48,6 +48,12 @@ pub(crate) enum SlashOutcome {
     DeferBtw {
         query: String,
     },
+    /// `/model`, `/model search`, `/model refresh`: discover provider models
+    /// off-loop, then open the searchable route picker.
+    DeferModelPicker {
+        initial_query: String,
+        refresh: bool,
+    },
     /// `/edit`: open the input buffer in `$EDITOR`.
     #[cfg(unix)]
     DeferExternalEditor,
@@ -366,7 +372,12 @@ pub(crate) fn prepare_compaction(
         augmented_instructions.as_deref(),
     )?;
     let tokens_before = tokens_before_cut(session, cut_idx);
-    let model = crate::provider::build_compaction_model(cfg, client, &session.model)?;
+    let model = crate::provider::build_compaction_model(
+        cfg,
+        client,
+        &session.model,
+        session.provider.as_str(),
+    )?;
 
     Ok(CompactionDecision::Ready(Box::new(CompactionRequest {
         model,
@@ -403,6 +414,7 @@ pub(crate) async fn rebuild_agent_parts(
     let model = client.completion_model(session.model.to_string());
     *agent = crate::provider::build_agent(
         model,
+        session.provider.as_str(),
         cli,
         cfg,
         context,
@@ -421,6 +433,81 @@ pub(crate) async fn rebuild_agent_parts(
         Some(session.id.to_string()),
     )
     .await;
+}
+
+pub(crate) struct RouteSwitchReport {
+    pub old_context_window: u64,
+    pub new_context_window: u64,
+}
+
+/// Prepare and atomically install a provider/model route. Provider/client
+/// construction and agent building happen before any live field is changed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn switch_active_route_parts(
+    agent: &mut AnyAgent,
+    client: &mut AnyClient,
+    session: &mut Session,
+    provider_alias: &str,
+    model_id: &str,
+    model_explicit: bool,
+    cli: &Cli,
+    cfg: &Config,
+    context: &mut ContextFiles,
+    permission: &Option<PermCheck>,
+    ask_tx: &Option<AskSender>,
+    question_tx: &Option<crate::agent::tools::question::QuestionSender>,
+    plan_tx: &Option<crate::agent::tools::plan::PlanSwitchSender>,
+    bg_store: &Option<crate::agent::tools::background::BackgroundStore>,
+    sandbox: &Sandbox,
+    #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
+    #[cfg(feature = "semantic")] semantic_manager: Option<&SemanticManager>,
+    #[cfg(feature = "lsp")] lsp_manager: Option<&std::sync::Arc<crate::lsp::manager::LspManager>>,
+) -> anyhow::Result<RouteSwitchReport> {
+    let providers = cfg.providers_map();
+    let prepared = crate::provider::prepare_active_route(
+        provider_alias,
+        model_id,
+        model_explicit,
+        &providers,
+        cfg.auth,
+    )?;
+    let model = prepared
+        .client
+        .completion_model(prepared.route.model_id.clone());
+    let replacement_agent = crate::provider::build_agent(
+        model,
+        &prepared.route.provider_alias,
+        cli,
+        cfg,
+        context,
+        permission.clone(),
+        ask_tx.clone(),
+        question_tx.clone(),
+        plan_tx.clone(),
+        bg_store.clone(),
+        #[cfg(feature = "lsp")]
+        lsp_manager.cloned(),
+        sandbox.clone(),
+        #[cfg(feature = "mcp")]
+        mcp_manager,
+        #[cfg(feature = "semantic")]
+        semantic_manager,
+        Some(session.id.to_string()),
+    )
+    .await;
+
+    let old_context_window = session.context_window;
+    let new_context_window = cfg.resolve_context_window(&prepared.route.model_id);
+    *client = prepared.client;
+    *agent = replacement_agent;
+    session.provider = compact_str::CompactString::new(&prepared.route.provider_alias);
+    session.model = compact_str::CompactString::new(&prepared.route.model_id);
+    session.model_explicit = prepared.route.model_explicit;
+    session.context_window = new_context_window;
+    Ok(RouteSwitchReport {
+        old_context_window,
+        new_context_window,
+    })
 }
 
 /// dirge-tv3p: the on-UI-thread INSTALL half — given the summary from the
@@ -625,7 +712,7 @@ pub async fn handle_slash(
         plan_phase,
     };
     match parts[0] {
-        "/model" => cmd::model::cmd_model(&mut ctx, &parts).await?,
+        "/model" => return cmd::model::cmd_model(&mut ctx, &parts).await,
         "/sessions" => cmd::sessions::cmd_sessions(&mut ctx, &parts).await?,
         "/reasoning" => cmd::model::cmd_reasoning(&mut ctx).await?,
         "/mode" => cmd::mode::cmd_mode(&mut ctx, &parts).await?,
@@ -823,7 +910,10 @@ fn slash_commands() -> Vec<(&'static str, &'static str)> {
         ),
         ("/memory", "reload the memory snapshot mid-session"),
         ("/mode", "view or set the permission/security mode"),
-        ("/model", "list configured models, or switch to one"),
+        (
+            "/model",
+            "search provider model catalogs, or switch directly",
+        ),
         ("/panel", "toggle the side panels on or off"),
         ("/plan", "run the phased plan workflow on a request"),
         ("/plugins", "list or load plugins"),

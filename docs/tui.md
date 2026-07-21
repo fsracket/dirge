@@ -60,6 +60,26 @@ kill-subagent) are **rebindable** via the `keybindings` config — see
 | Mouse drag | Select text (copies to clipboard on release) |
 | (input) | Live token count shown next to input bar (`N tk`) |
 
+## Model picker
+
+Bare `/model` discovers models advertised by every configured provider and
+opens a fuzzy-searchable picker. Type to filter across provider aliases, model
+ids, and display names; use Up/Down to move, Enter to switch the exact
+provider/model route shown, and Esc to close it without changing the session.
+
+`/model search <query>` opens with an initial filter. `/model refresh` forces a
+new provider lookup; otherwise successful catalogs are cached in memory for 15
+minutes. `/model <exact-id>` remains the direct escape hatch for a model that
+an endpoint accepts but does not advertise.
+
+Rows label their provenance as `live`, `configured`, `current`, or `suggested`.
+`live` means the endpoint advertised the model under the current credentials;
+it is not a guarantee that every request shape or account tier can use it. A
+failed provider is reported without hiding results from providers that did
+respond, and a stale last-successful catalog remains available after refresh
+failures. While an agent turn is running, bare `/model` only reports the current
+route; the picker becomes available again when the TUI is idle.
+
 ## Tool output display
 
 | Feature | Detail |

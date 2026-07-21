@@ -18,6 +18,7 @@ pub(crate) mod input;
 pub(crate) mod input_reader;
 pub(crate) mod keymap;
 mod markdown;
+pub(crate) mod model_catalog_phase;
 pub(crate) mod notifications;
 pub(crate) mod panel_data;
 mod panel_render;
@@ -129,6 +130,65 @@ fn real_user_prompt(msg: &SessionMessage) -> Option<&str> {
         return None;
     }
     Some(content)
+}
+
+fn model_picker_items(
+    entries: Vec<crate::provider::catalog::ModelCatalogEntry>,
+    active_provider: &str,
+    active_model: &str,
+) -> Vec<crate::ui::picker::SearchItem<crate::provider::catalog::ModelCatalogEntry>> {
+    entries
+        .into_iter()
+        .map(|entry| {
+            let active = entry.provider_alias.eq_ignore_ascii_case(active_provider)
+                && entry.id == active_model;
+            let marker = if active { "*" } else { " " };
+            let display = entry.display_name.as_deref().unwrap_or("");
+            let context = entry
+                .context_window
+                .map(format_context_window)
+                .unwrap_or_default();
+            let mut caps = String::new();
+            if entry.supports_tools == Some(true) {
+                caps.push_str(" tools");
+            }
+            if entry.supports_images == Some(true) {
+                caps.push_str(" vision");
+            }
+            let label = format!(
+                "{marker} {:<12} {:<36} {:<24} {:<6} {}{}",
+                entry.provider_alias,
+                entry.id,
+                display,
+                context,
+                entry.source.label(),
+                caps,
+            );
+            let search_text = format!(
+                "{} {} {} {} {}",
+                entry.provider_alias,
+                entry.id,
+                display,
+                entry.source.label(),
+                caps,
+            );
+            crate::ui::picker::SearchItem {
+                value: entry,
+                label,
+                search_text,
+            }
+        })
+        .collect()
+}
+
+fn format_context_window(tokens: u64) -> String {
+    if tokens >= 1_000_000 && tokens.is_multiple_of(1_000_000) {
+        format!("{}m", tokens / 1_000_000)
+    } else if tokens >= 1_000 && tokens.is_multiple_of(1_000) {
+        format!("{}k", tokens / 1_000)
+    } else {
+        tokens.to_string()
+    }
 }
 
 /// Formats a tool call showing only the primary file/command parameter.
@@ -741,6 +801,10 @@ pub async fn run_interactive(
                     entry.paste(text);
                     render_custom_entry(&mut renderer, &entry.buf, entry.input_anchor);
                     renderer.request_repaint();
+                } else if let state::InputMode::ModelPicker(model) = &mut ui.input_mode {
+                    model.picker.append_query(text);
+                    renderer.set_rewind_overlay(Some(model.picker.overlay()));
+                    renderer.request_repaint();
                 }
                 continue;
             }
@@ -748,6 +812,113 @@ pub async fn run_interactive(
                 let key = *key;
                 match ui.input_mode.kind() {
                     state::ModalKind::Compose => {}
+                    state::ModalKind::ModelCatalogLoading => {
+                        let cancel = key.code == KeyCode::Esc
+                            || (key.code == KeyCode::Char('c')
+                                && key.modifiers.contains(KeyModifiers::CONTROL));
+                        if cancel {
+                            ui.model_catalog_phase = None;
+                            ui.input_mode = state::InputMode::Compose;
+                            renderer.set_rewind_overlay(None);
+                            renderer.write_line("model discovery cancelled", theme::dim())?;
+                            renderer.request_repaint();
+                        }
+                    }
+                    state::ModalKind::ModelPicker => {
+                        let action = {
+                            let state::InputMode::ModelPicker(model) = &mut ui.input_mode else {
+                                unreachable!()
+                            };
+                            model.picker.handle_key(key)
+                        };
+                        match action {
+                            crate::ui::picker::SearchPickerAction::None => {
+                                let state::InputMode::ModelPicker(model) = &ui.input_mode else {
+                                    unreachable!()
+                                };
+                                renderer.set_rewind_overlay(Some(model.picker.overlay()));
+                            }
+                            crate::ui::picker::SearchPickerAction::Cancelled => {
+                                ui.input_mode = state::InputMode::Compose;
+                                renderer.set_rewind_overlay(None);
+                            }
+                            crate::ui::picker::SearchPickerAction::Selected(entry) => {
+                                ui.input_mode = state::InputMode::Compose;
+                                renderer.set_rewind_overlay(None);
+                                match crate::ui::slash::switch_active_route_parts(
+                                    &mut agent,
+                                    &mut client,
+                                    session,
+                                    &entry.provider_alias,
+                                    &entry.id,
+                                    true,
+                                    cli,
+                                    cfg,
+                                    context,
+                                    &permission,
+                                    &ask_tx,
+                                    &question_tx,
+                                    &plan_tx,
+                                    &bg_store,
+                                    &sandbox,
+                                    #[cfg(feature = "mcp")]
+                                    mcp_manager.as_ref(),
+                                    #[cfg(feature = "semantic")]
+                                    semantic_manager,
+                                    #[cfg(feature = "lsp")]
+                                    lsp_manager.as_ref(),
+                                )
+                                .await
+                                {
+                                    Ok(report) => {
+                                        renderer.write_line(
+                                            &format!(
+                                                "switched to model: {}  ·  {}",
+                                                session.model, session.provider
+                                            ),
+                                            c_agent(),
+                                        )?;
+                                        let budget = report
+                                            .new_context_window
+                                            .saturating_sub(cfg.resolve_reserve_tokens());
+                                        if report.new_context_window < report.old_context_window
+                                            && session.total_estimated_tokens > budget
+                                        {
+                                            renderer.write_line(
+                                                &format!(
+                                                    "warning: session uses ~{}k tokens but new model's context budget is ~{}k. Run /compress before the next prompt or the next turn may overflow.",
+                                                    session.total_estimated_tokens / 1_000,
+                                                    budget / 1_000,
+                                                ),
+                                                c_error(),
+                                            )?;
+                                        }
+                                        if !cli.no_session
+                                            && let Err(e) = crate::session::storage::save_session(session)
+                                        {
+                                            renderer.write_line(
+                                                &format!("warning: failed to save session: {e}"),
+                                                c_error(),
+                                            )?;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        renderer.write_line(
+                                            &format!(
+                                                "could not switch to '{}' on '{}': {e}. Keeping '{}' on '{}'.",
+                                                entry.id,
+                                                entry.provider_alias,
+                                                session.model,
+                                                session.provider,
+                                            ),
+                                            c_error(),
+                                        )?;
+                                    }
+                                }
+                            }
+                        }
+                        renderer.request_repaint();
+                    }
                     state::ModalKind::PlanSwitch => match key.code {
                         KeyCode::Char('y') | KeyCode::Enter => {
                             let state::InputMode::PlanSwitch {
@@ -777,6 +948,7 @@ pub async fn run_interactive(
                             let model = client.completion_model(session.model.to_string());
                             agent = crate::provider::build_agent(
                                 model,
+                                session.provider.as_str(),
                                 cli,
                                 cfg,
                                 context,
@@ -1317,7 +1489,12 @@ pub async fn run_interactive(
     // compaction actually does. Side-effect-free in the common case (no
     // `summarization_provider` set → no client is built).
     if matches!(
-        crate::provider::build_compaction_model(cfg, &client, &session.model),
+        crate::provider::build_compaction_model(
+            cfg,
+            &client,
+            &session.model,
+            session.provider.as_str(),
+        ),
         Err(ref e) if crate::provider::is_anthropic_oauth_compaction_disabled_error(e)
     ) {
         renderer.write_line(
@@ -2177,6 +2354,7 @@ pub async fn run_interactive(
                                     let model = client.completion_model(session.model.to_string());
                                     agent = crate::provider::build_agent(
                                         model,
+                                        session.provider.as_str(),
                                         cli,
                                         cfg,
                                         context,
@@ -2741,6 +2919,38 @@ pub async fn run_interactive(
                                                 // orphan the first.
                                                 ui.is_running = true;
                                                 renderer.set_avatar_state(avatar::AvatarState::Thinking);
+                                            }
+                                            Ok(SlashOutcome::DeferModelPicker {
+                                                initial_query,
+                                                refresh,
+                                            }) => {
+                                                ui.model_catalog_phase = Some(
+                                                    crate::ui::model_catalog_phase::spawn(
+                                                        cfg.providers_map(),
+                                                        cfg.auth,
+                                                        session.provider.to_string(),
+                                                        session.model.to_string(),
+                                                        initial_query,
+                                                        refresh,
+                                                    ),
+                                                );
+                                                ui.input_mode =
+                                                    state::InputMode::ModelCatalogLoading;
+                                                renderer.set_rewind_overlay(Some(
+                                                    crate::ui::picker::PickerOverlay {
+                                                        title: Some(
+                                                            "Discovering models… (Esc to cancel)"
+                                                                .to_string(),
+                                                        ),
+                                                        rows: Vec::new(),
+                                                        selected: 0,
+                                                        empty_hint: Some(
+                                                            "contacting configured providers"
+                                                                .to_string(),
+                                                        ),
+                                                    },
+                                                ));
+                                                renderer.request_repaint();
                                             }
                                             #[cfg(unix)]
                                             Ok(SlashOutcome::DeferExternalEditor) => {
@@ -3676,15 +3886,12 @@ pub async fn run_interactive(
                                 for err in &result.errors {
                                     renderer.write_line(&format!("[plugin] {}", err), c_error())?;
                                 }
-                                // Apply a prepare-next-run model swap on-loop (agent
-                                // rebuild) before the tail runs. dirge-m6ut: the
-                                // client swap happens FIRST, while `&mut client` is
-                                // still free — after this `make_agent_build_deps!`
-                                // borrows the (possibly new) client immutably.
+                                // Apply a prepare-next-run model swap on-loop before
+                                // the tail runs. The shared route seam builds the
+                                // replacement client and agent before installing either.
                                 #[cfg(feature = "plugin")]
                                 if let Some(next_model) = result.next_model {
-                                    match run_handlers::done::prepare_next_model_client(
-                                        &mut client,
+                                    match run_handlers::done::prepare_next_model_route(
                                         &mut renderer,
                                         session,
                                         cfg,
@@ -3692,18 +3899,49 @@ pub async fn run_interactive(
                                     )? {
                                         run_handlers::done::NextModelAction::Skip => {}
                                         run_handlers::done::NextModelAction::Apply {
-                                            swapped_provider,
+                                            provider_alias,
                                         } => {
-                                            let mut ctx = make_run_ctx!();
-                                            run_handlers::done::apply_next_model(
-                                                &mut ctx,
+                                            let old_model = session.model.clone();
+                                            match crate::ui::slash::switch_active_route_parts(
                                                 &mut agent,
-                                                context,
-                                                &make_agent_build_deps!(),
+                                                &mut client,
+                                                session,
+                                                &provider_alias,
                                                 &next_model,
-                                                swapped_provider,
+                                                true,
+                                                cli,
+                                                cfg,
+                                                context,
+                                                &permission,
+                                                &ask_tx,
+                                                &question_tx,
+                                                &plan_tx,
+                                                &bg_store,
+                                                &sandbox,
+                                                #[cfg(feature = "mcp")]
+                                                mcp_manager.as_ref(),
+                                                #[cfg(feature = "semantic")]
+                                                semantic_manager,
+                                                #[cfg(feature = "lsp")]
+                                                lsp_manager.as_ref(),
                                             )
-                                            .await?;
+                                            .await
+                                            {
+                                                Ok(_) => renderer.write_line(
+                                                    &format!(
+                                                        "[plugin] swapped model: {old_model} → {}  ·  {}",
+                                                        session.model, session.provider
+                                                    ),
+                                                    c_agent(),
+                                                )?,
+                                                Err(e) => renderer.write_line(
+                                                    &format!(
+                                                        "[plugin] can't swap to '{next_model}' on '{provider_alias}': {e} — staying on '{}' at '{}'.",
+                                                        session.model, session.provider,
+                                                    ),
+                                                    c_error(),
+                                                )?,
+                                            }
                                         }
                                     }
                                 }
@@ -4015,6 +4253,56 @@ pub async fn run_interactive(
                         // would show idle while running (GH #621).
                         renderer.request_repaint();
                     }
+                    model_catalog_result = async {
+                        if let Some(ph) = &mut ui.model_catalog_phase {
+                            ph.core.rx.recv().await
+                        } else {
+                            std::future::pending().await
+                        }
+                    } => {
+                        let Some(handle) = ui.model_catalog_phase.take() else {
+                            continue;
+                        };
+                        // Cancellation restores Compose and drops the handle. A terminal
+                        // event already queued at the same instant must not reopen it.
+                        if !matches!(ui.input_mode, state::InputMode::ModelCatalogLoading) {
+                            continue;
+                        }
+                        match model_catalog_result {
+                            Some(catalog) => {
+                                for notice in catalog.notices {
+                                    renderer.write_line(
+                                        &format!("model catalog: {notice}"),
+                                        theme::warn(),
+                                    )?;
+                                }
+                                let items = model_picker_items(
+                                    catalog.entries,
+                                    session.provider.as_str(),
+                                    session.model.as_str(),
+                                );
+                                let picker = crate::ui::picker::SearchPicker::new(
+                                    "Models:",
+                                    items,
+                                    handle.initial_query,
+                                );
+                                let overlay = picker.overlay();
+                                ui.input_mode = state::InputMode::ModelPicker(
+                                    state::ModelPickerState { picker },
+                                );
+                                renderer.set_rewind_overlay(Some(overlay));
+                            }
+                            None => {
+                                ui.input_mode = state::InputMode::Compose;
+                                renderer.set_rewind_overlay(None);
+                                renderer.write_line(
+                                    "model discovery ended unexpectedly",
+                                    c_error(),
+                                )?;
+                            }
+                        }
+                        renderer.request_repaint();
+                    }
                     // dirge-nret: the spawned `/btw` side query streams its answer here,
                     // so the loop stays responsive (and Ctrl+C-able) while the one-shot
                     // LLM call runs. Binds the Option directly so a closed channel
@@ -4104,7 +4392,7 @@ pub async fn run_interactive(
                                             context.reload();
                                             let model = client.completion_model(session.model.to_string());
                                             agent = crate::provider::build_agent(
-                                                model, cli, cfg, context,
+                                                model, session.provider.as_str(), cli, cfg, context,
                                                 permission.clone(), ask_tx.clone(), question_tx.clone(),
                                                 plan_tx.clone(), bg_store.clone(),
                                                 #[cfg(feature = "lsp")] lsp_manager.clone(),

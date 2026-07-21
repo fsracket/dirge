@@ -1,6 +1,6 @@
 # Model Catalog and Searchable Picker — Implementation Plan
 
-Status: proposed
+Status: implemented on `codex/model-catalog-picker`
 
 ## Objective
 

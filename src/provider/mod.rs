@@ -4,11 +4,13 @@ pub(crate) mod anthropic_oauth;
 pub(crate) mod auth;
 mod billing_fallback;
 mod build;
+pub mod catalog;
 pub mod client;
 pub(crate) mod codex_http;
 pub(crate) mod compressing_http;
 mod dispatch;
 mod resolve;
+mod route;
 mod run;
 mod spawn;
 mod stream_dispatch;
@@ -19,6 +21,7 @@ pub use self::spawn::Prompt;
 pub use build::*;
 pub use dispatch::*;
 pub use resolve::*;
+pub use route::*;
 
 /// Process-global handle to the most recently built interactive agent.
 /// Tooled subagents (`TaskTool` tooled branch) fork a filtered runner off
